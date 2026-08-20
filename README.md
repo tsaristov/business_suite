@@ -11,7 +11,7 @@ documentation for the suite. It's primary use is as a system to help me manage m
 ## Getting Started
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/tsaristov/business_suite.git
 cd custom_business_suite
 ```
 
