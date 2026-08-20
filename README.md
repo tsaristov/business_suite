@@ -22,8 +22,32 @@ _Setup and build instructions to be added as the project takes shape._
 ```
 custom_business_suite/
 ├── README.md
-└── ...
+├── assistant/
+├── budget/
+├── calendar/
+├── checklist/
+└── habits/
 ```
+
+## Project Modules
+All of the projects can sync together using the assistant.
+
+An overview of the modules inside the suite, and their use/purpose.
+
+### Assistant
+An LLM powered AI assistant with RAG context, tool usage, and agentic capabilities.
+
+### Budget
+A budget tracking app that can track what you get and what you pay for, and where it should be allocated.
+
+### Calendar
+A calendar app to track your days, and anything you need to be doing throughout it.
+
+### Checklist
+A to do list, with multiple diffrent forms of tracking.
+
+### Habits
+A daily habit tracking system for diffrent daily habits that should be completed.
 
 ## License
 
