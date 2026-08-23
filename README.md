@@ -13,6 +13,11 @@ documentation for the suite. It's primary use is as a system to help me manage m
 ```bash
 git clone https://github.com/tsaristov/business_suite.git
 cd custom_business_suite
+
+python3 -m venv .venv
+pip3 install -r requirements.txt
+
+python3 app.py
 ```
 
 _Setup and build instructions to be added as the project takes shape._
