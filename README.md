@@ -1,6 +1,6 @@
 # Custom Business Suite
 
-A custom suite of business applications for my own personal use.
+---
 
 ## Overview
 
@@ -27,21 +27,23 @@ _Setup and build instructions to be added as the project takes shape._
 ```
 custom_business_suite/
 ├── README.md
+├── .gitignore
 ├── app.py                  # Flask web UI (tabs pull each tool's interface.html)
 ├── requirements.txt
 ├── templates/
 │   └── index.html          # app shell; includes tools/<name>/interface.html per tab
 ├── assistant/
+│   └── output.md           # assistant scratch/output (layer not built yet)
 └── tools/
-    ├── budget/             # budget.py (CLI) · agent.py (AI tool layer) · interface.html
-    ├── calendar/
-    ├── checklist/
-    └── habits/
+    ├── budget/             # budget.py (CLI) · agent.py (AI tool layer) · interface.html · data.json
+    ├── calendar/           # calendar.py · agent.py · interface.html · data.json
+    ├── checklist/          # checklist.py · agent.py · interface.html · data.json
+    └── habits/             # habits.py · agent.py · interface.html · data.json
 ```
 
 Each tool folder is self-contained: a CLI script, an `agent.py` capability layer for
-the assistant, an `interface.html` UI fragment for the web app, and its own
-`data.json` store (shared across all three).
+the assistant, and an `interface.html` UI fragment for the web app. All four tools
+persist to their own `data.json` (created on first save, git-ignored).
 
 ## Project Tools
 The core behind the project is a modular system for business owneres to be able to access
@@ -84,4 +86,8 @@ habit is kept.
 
 ## License
 
-TBD
+Licensed under the [MIT License](LICENSE) — free to use, modify, and sell,
+including commercially. The one requirement: keep the copyright notice, so
+credit stays with the author.
+
+Copyright (c) 2026 Daniel Tsaristov
