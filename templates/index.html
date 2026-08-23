@@ -39,5 +39,28 @@
   </div>
 </div>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  // Refresh one tool tab's pane in place — used by the Assistant after it changes data
+  // (see assistant/interface.html). Re-fetches the server-rendered fragment and swaps
+  // just that pane, re-executing its <script> tags so charts / calendar re-init.
+  window.refreshTab = async function (name) {
+    const pane = document.getElementById(name);
+    if (!pane) return;
+    try {
+      const res = await fetch("/?tab=" + encodeURIComponent(name));
+      const html = await res.text();
+      const doc = new DOMParser().parseFromString(html, "text/html");
+      const fresh = doc.getElementById(name);
+      if (!fresh) return;
+      pane.innerHTML = fresh.innerHTML;
+      // innerHTML-injected <script> nodes don't run; re-create them so they do.
+      pane.querySelectorAll("script").forEach((old) => {
+        const s = document.createElement("script");
+        if (old.src) s.src = old.src; else s.textContent = old.textContent;
+        old.replaceWith(s);
+      });
+    } catch (e) { /* leave the stale pane on error */ }
+  };
+</script>
 </body>
 </html>

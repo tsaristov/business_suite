@@ -1,10 +1,23 @@
 {# Habits tool UI fragment. Rendered inside the Flask app's Habits tab
-   (see templates/index.html). Context: `habits` = list of enriched dicts from
-   app._habits_context() -> {name, total, done_today, streak, last, grid}. #}
+   (see templates/index.html). Context: `habits` = app._habits_context() ->
+   { habits: [{name, total, done_today, streak, last, columns}], month_labels }.
+   `columns` is one entry per week (Sun→Sat), each a list of 7 day cells. #}
 <style>
-  .habit-heatmap { display: grid; grid-template-columns: repeat(7, 15px); gap: 3px; }
-  .habit-cell { width: 15px; height: 15px; border-radius: 3px; background: #e9ecef; }
+  .habit-months { display: flex; gap: 3px; font-size: .7rem; color: #6c757d;
+                  margin-left: 1.6rem; }
+  .habit-months span { width: 13px; white-space: nowrap; overflow: visible; }
+  .habit-hm { display: flex; align-items: flex-start; }
+  .habit-daylabels { display: flex; flex-direction: column; gap: 3px;
+                     font-size: .6rem; color: #6c757d; width: 1.6rem; }
+  .habit-daylabels span { height: 13px; line-height: 13px; }
+  .habit-cols { display: flex; gap: 3px; }
+  .habit-col { display: flex; flex-direction: column; gap: 3px; }
+  .habit-cell { width: 13px; height: 13px; border-radius: 3px; background: #ebedf0; }
   .habit-cell.done { background: #198754; }
+  .habit-cell.future { background: transparent; }
+  .habit-legend { display: flex; align-items: center; gap: .35rem; font-size: .75rem;
+                  color: #6c757d; margin-top: .35rem; }
+  .habit-legend .sw { width: 13px; height: 13px; border-radius: 3px; display:inline-block; }
 </style>
 <form class="row g-2 align-items-end my-3" method="post" action="{{ url_for('habits_add') }}">
   <div class="col-md-4"><label class="form-label">Habit name</label>
@@ -12,9 +25,9 @@
   <div class="col-auto"><button class="btn btn-primary">Add</button></div>
 </form>
 <ul class="list-group">
-  {% for h in habits %}
+  {% for h in habits.habits %}
     <li class="list-group-item">
-      <div class="d-flex justify-content-between align-items-center">
+      <div class="d-flex justify-content-between align-items-center mb-2">
         <span>
           <strong>{{ h.name }}</strong>
           <span class="badge bg-info text-dark">{{ h.total }} done</span>
@@ -29,11 +42,29 @@
           {% endif %}
         </form>
       </div>
-      <div class="habit-heatmap mt-2" title="Last {{ h.grid|length }} days">
-        {% for cell in h.grid %}
-          <span class="habit-cell {{ 'done' if cell.done else '' }}"
-                title="{{ cell.date }}{{ ' ✓' if cell.done else '' }}"></span>
-        {% endfor %}
+
+      <div class="habit-months">
+        {% for label in habits.month_labels %}<span>{{ label }}</span>{% endfor %}
+      </div>
+      <div class="habit-hm">
+        <div class="habit-daylabels">
+          <span></span><span>Mon</span><span></span><span>Wed</span>
+          <span></span><span>Fri</span><span></span>
+        </div>
+        <div class="habit-cols">
+          {% for col in h.columns %}
+            <div class="habit-col">
+              {% for cell in col %}
+                <span class="habit-cell {{ 'done' if cell.done else '' }}{{ ' future' if cell.future else '' }}"
+                      title="{{ cell.date }}{{ ' ✓' if cell.done else '' }}"></span>
+              {% endfor %}
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="habit-legend">
+        <span class="sw" style="background:#ebedf0"></span> not done
+        <span class="sw" style="background:#198754"></span> done
       </div>
     </li>
   {% else %}

@@ -10,16 +10,20 @@ Design (see output.md):
   mutation runs through a module's agent.execute(), which validates params and gates
   destructive actions behind a confirmation.
 - Two-stage routing keeps the tool count per model call small (accurate on 3-4B):
-    stage 1 -> pick the module   (4 choices)
-    stage 2 -> pick that module's action (<=17 choices)
+    stage 1 -> pick the relevant module(s)  (can be several: "what's my day")
+    stage 2 -> pick each module's action (<=17 choices), then synthesize one reply
 - Grounding (RAG): a compact, capped snapshot of all four stores is read fresh each
   turn so the model can answer factual questions without holding the whole database.
 - Confirmation is deterministic (a yes/no word list), never judged by the model.
+- History lives in named, persistent sessions (sidebar in the UI).
 
 Public API (used by app.py):
-    chat(message)   -> {"reply", "action", "results"}
-    history(limit)  -> {"history": [{role, message, created_at}, ...]}
-    clear_history() -> {"ok": True}
+    chat(message, session_id=None)        -> {reply, action, results, modules, changed}
+    chat_events(message, session_id=None) -> generator of {stage}/{final} events
+    history(limit, session_id=None)       -> {session_id, history: [...]}
+    clear_history(session_id=None)        -> {ok, session_id}
+    list_sessions() / new_session() / switch_session(id) /
+    rename_session(id, title) / delete_session(id)
 """
 
 import importlib.util
@@ -72,15 +76,55 @@ MODULES = {
 
 
 # --------------------------------------------------------------------------- #
-# Store (conversation history + single-slot pending confirmation)
+# Store — multiple named chat sessions, each with its own history + pending slot.
+# Shape: {"sessions": [{id, title, created_at, updated_at, history, pending}],
+#         "active_id": <id>}
 # --------------------------------------------------------------------------- #
+def _now():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _new_id():
+    return datetime.now().strftime("%Y%m%d%H%M%S%f")
+
+
+def _blank_session(title="New chat"):
+    ts = _now()
+    return {"id": _new_id(), "title": title, "created_at": ts, "updated_at": ts,
+            "history": [], "pending": None}
+
+
 def _load_store():
+    # `dirty` = we synthesized/migrated something and must persist it, so ids stay
+    # stable across pure reads (list_sessions/history) that don't otherwise save.
+    dirty = False
     if not os.path.exists(_DATA) or os.path.getsize(_DATA) == 0:
-        return {"history": [], "pending": None}
+        s = _blank_session()
+        data = {"sessions": [s], "active_id": s["id"]}
+        _save_store(data)
+        return data
     with open(_DATA) as f:
         data = json.load(f)
-    data.setdefault("history", [])
-    data.setdefault("pending", None)
+    # Migrate the old single-conversation shape into one session.
+    if "sessions" not in data:
+        s = _blank_session()
+        s["history"] = data.get("history", [])
+        s["pending"] = data.get("pending")
+        data = {"sessions": [s], "active_id": s["id"]}
+        dirty = True
+    if not data.get("sessions"):
+        s = _blank_session()
+        data["sessions"] = [s]
+        data["active_id"] = s["id"]
+        dirty = True
+    for sess in data["sessions"]:
+        sess.setdefault("history", [])
+        sess.setdefault("pending", None)
+    if data.get("active_id") not in {s["id"] for s in data["sessions"]}:
+        data["active_id"] = data["sessions"][0]["id"]
+        dirty = True
+    if dirty:
+        _save_store(data)
     return data
 
 
@@ -89,11 +133,23 @@ def _save_store(data):
         json.dump(data, f, indent=2)
 
 
-def _record(store, role, message):
-    store["history"].append({
-        "role": role, "message": message,
-        "created_at": datetime.now().isoformat(timespec="seconds"),
+def _get_session(store, session_id=None):
+    """Return the requested session, or the active one. Falls back to the first."""
+    sid = session_id or store.get("active_id")
+    for sess in store["sessions"]:
+        if sess["id"] == sid:
+            return sess
+    return store["sessions"][0]
+
+
+def _record(session, role, message):
+    session["history"].append({
+        "role": role, "message": message, "created_at": _now(),
     })
+    session["updated_at"] = _now()
+    # Auto-title a fresh session from its first user message.
+    if role == "user" and session.get("title") in (None, "", "New chat"):
+        session["title"] = (message[:40] + "…") if len(message) > 40 else message
 
 
 # --------------------------------------------------------------------------- #
@@ -144,7 +200,9 @@ def _cap(items, n=10):
 
 def _grounding():
     """Read-only summary of current suite state for the model's context."""
-    lines = [f"Today is {date.today().isoformat()}.", ""]
+    now = datetime.now()
+    lines = [f"Today is {now.strftime('%A %Y-%m-%d')}, current time "
+             f"{now.strftime('%H:%M')}.", ""]
 
     b = MODULES["budget"]
     summ = b.get_summary()
@@ -190,21 +248,28 @@ _PERSONA = (
 # --------------------------------------------------------------------------- #
 # Two-stage routing
 # --------------------------------------------------------------------------- #
-_SELECT_MODULE_TOOL = {
+_SELECT_MODULES_TOOL = {
     "type": "function",
     "function": {
-        "name": "select_module",
+        "name": "select_modules",
         "description": (
-            "Route the user's request to a suite module. ALWAYS call this exactly "
-            "once. Pick 'budget', 'calendar', 'checklist', or 'habits' for anything "
-            "about money, scheduling, tasks/to-dos, or habits — especially any request "
-            "to add, change, complete, or delete something. Pick 'none' ONLY for pure "
-            "small talk or questions unrelated to those four areas."),
+            "Route the user's request to the relevant suite modules. ALWAYS call this "
+            "exactly once. Include EVERY module the request touches — for a broad "
+            "question like 'what does my day look like' pick calendar, checklist, AND "
+            "habits. Pick a module for anything about money (budget), scheduling "
+            "(calendar), tasks/to-dos (checklist), or habits — especially any request "
+            "to add, change, complete, or delete something. Use an empty list ONLY for "
+            "pure small talk unrelated to those four areas."),
         "parameters": {
             "type": "object",
-            "properties": {"module": {"type": "string",
-                                      "enum": list(MODULES) + ["none"]}},
-            "required": ["module"],
+            "properties": {
+                "modules": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": list(MODULES)},
+                    "description": "All relevant modules, in the order to handle them.",
+                }
+            },
+            "required": ["modules"],
         },
     },
 }
@@ -237,34 +302,67 @@ def _keyword_route(text):
     return None
 
 
+# Broad "how's my day" queries should always span calendar + checklist + habits — small
+# models tend to pick just one module, so force the set deterministically.
+_OVERVIEW = ("my day", "the day", "look like today", "today look", "my agenda",
+             "agenda", "overview", "rundown", "schedule today", "have today",
+             "on today", "brief me", "catch me up", "what do i have")
+_OVERVIEW_MODULES = ["calendar", "checklist", "habits"]
+
+
+def _is_overview(text):
+    t = text.lower()
+    return any(p in t for p in _OVERVIEW)
+
+
 def _stage1(user_message, grounding):
-    """Pick a module, or answer directly from grounding. Returns
-    (module_name | None, direct_reply | None)."""
+    """Pick the relevant module(s), or answer directly from grounding. Returns
+    (modules: list, direct_reply | None). An empty list + None reply means the model
+    runtime was unreachable."""
     messages = [
         {"role": "system", "content": f"{_PERSONA}\n\nCurrent state:\n{grounding}"},
         {"role": "user", "content": user_message},
     ]
-    msg = _model_chat(messages, tools=[_SELECT_MODULE_TOOL])
+    msg = _model_chat(messages, tools=[_SELECT_MODULES_TOOL])
     if msg is None:
-        return None, None  # runtime down -> caller handles fallback
-    chosen = None
+        return [], None  # runtime down -> caller handles fallback
+    chosen = []
     for call in (msg.tool_calls or []):
-        if call.function.name == "select_module":
-            chosen = dict(call.function.arguments).get("module")
+        if call.function.name == "select_modules":
+            raw = dict(call.function.arguments).get("modules") or []
+            if isinstance(raw, str):
+                raw = [raw]
+            chosen = [m for m in raw if m in MODULES]
             break
-    if chosen in MODULES:
-        return chosen, None
-    # Model chose 'none' or free-texted. Trust a keyword match over a possibly
+    # Force the full set for broad day-overview questions (models under-select here).
+    overview = _OVERVIEW_MODULES if _is_overview(user_message) else []
+    if chosen or overview:
+        # De-dupe, preserve order.
+        return list(dict.fromkeys(chosen + overview)), None
+    # Model returned nothing / free-texted. Trust a keyword match over a possibly
     # hallucinated answer so mutations aren't silently dropped.
     net = _keyword_route(user_message)
     if net:
-        return net, None
-    return None, _clean(msg.content) or None
+        return [net], None
+    return [], _clean(msg.content) or None
 
 
-def _stage2(module_name, user_message, grounding, max_hops=4):
+# Read-only tool names across all modules; anything else that succeeds is a write
+# (drives the `changed` flag for auto-refreshing the affected tab).
+_READ_ACTIONS = {
+    "get_summary", "list_transactions", "list_categories", "limit_status",
+    "bill_status", "goal_status", "spending_breakdown",
+    "list_events", "list_items", "list_habits",
+}
+
+
+def _stage2_events(module_name, user_message, grounding, max_hops=4):
     """Offer only the chosen module's tools; run a bounded tool-use loop.
-    Returns (reply, action, results, pending)."""
+
+    A generator: yields ("stage", label) progress events as it works, then a single
+    terminal ("done", reply, action, results, pending, wrote) tuple, where `wrote` is
+    True if a successful mutating tool ran (so the caller can refresh that tab).
+    """
     module = MODULES[module_name]
     manifest = module.describe()
     tools = [_as_function_tool(t) for t in manifest["tools"]]
@@ -279,18 +377,25 @@ def _stage2(module_name, user_message, grounding, max_hops=4):
         {"role": "user", "content": user_message},
     ]
     results = []
+    wrote = False
     for _ in range(max_hops):
+        yield ("stage", "Deciding next step")
         msg = _model_chat(messages, tools=tools)
         if msg is None:
-            return _HELP, "fallback", results, None
+            yield ("done", _HELP, "fallback", results, None, wrote)
+            return
         calls = msg.tool_calls or []
         if not calls:
+            yield ("stage", "Generating reply")
             reply = _clean(msg.content) or "Done."
-            return reply, ("tool_ok" if results else "answered"), results, None
+            yield ("done", reply, ("tool_ok" if results else "answered"),
+                   results, None, wrote)
+            return
         messages.append(msg)
         for call in calls:
             action = call.function.name
             params = dict(call.function.arguments or {})
+            yield ("stage", f"Using {module_name}: {action.replace('_', ' ')}")
             res = module.execute(action, params)
             results.append(res)
             if res.get("needs_confirmation"):
@@ -301,10 +406,14 @@ def _stage2(module_name, user_message, grounding, max_hops=4):
                 reply = (f"Please confirm: {action.replace('_', ' ')}. "
                          "This can't be undone. Reply 'yes' to confirm or 'no' to "
                          "cancel.")
-                return reply, "needs_confirmation", results, pending
+                yield ("done", reply, "needs_confirmation", results, pending, wrote)
+                return
+            if res.get("ok") and action not in _READ_ACTIONS:
+                wrote = True
             messages.append({"role": "tool", "tool_name": action,
                              "content": json.dumps(res)})
-    return "Stopped after several steps — please rephrase.", "tool_ok", results, None
+    yield ("done", "Stopped after several steps — please rephrase.",
+           "tool_ok", results, None, wrote)
 
 
 # --------------------------------------------------------------------------- #
@@ -324,82 +433,238 @@ def _pending_alive(pending):
     return age <= _PENDING_TTL_SECONDS
 
 
-def _resolve_pending(store, text):
+def _resolve_pending(session, text):
     """If a live pending confirmation exists and the text is yes/no, resolve it.
-    Returns an envelope dict, or None to let normal routing proceed."""
-    pending = store.get("pending")
+    Returns an envelope dict (with `modules`/`changed`), or None to let normal
+    routing proceed."""
+    pending = session.get("pending")
     if not _pending_alive(pending):
-        store["pending"] = None
+        session["pending"] = None
         return None
     word = _norm(text)
     if word in _AFFIRM:
-        module = MODULES[pending["module"]]
-        res = module.execute(pending["action"], pending["params"], confirm=True)
-        store["pending"] = None
+        module_name = pending["module"]
+        res = MODULES[module_name].execute(pending["action"], pending["params"],
+                                           confirm=True)
+        session["pending"] = None
         reply = "Done." if res.get("ok") else f"Couldn't do that: {res.get('error')}"
-        return {"reply": reply, "action": "confirmed", "results": [res]}
+        return {"reply": reply, "action": "confirmed", "results": [res],
+                "modules": [module_name], "changed": bool(res.get("ok"))}
     if word in _DENY:
-        store["pending"] = None
+        session["pending"] = None
         return {"reply": "Okay, cancelled — nothing changed.",
-                "action": "canceled", "results": []}
+                "action": "canceled", "results": [], "modules": [], "changed": False}
     # Neither yes nor no: drop the stale prompt and treat as ordinary input.
-    store["pending"] = None
+    session["pending"] = None
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Synthesis — combine several modules' tool results into one reply
+# --------------------------------------------------------------------------- #
+def _synthesize(user_message, grounding, collected):
+    """One model call that turns per-module tool results into a single short reply.
+    `collected` is a list of (module_name, results). Falls back to a plain join."""
+    blob = "\n".join(f"{m}: {json.dumps(r)}" for m, r in collected)
+    messages = [
+        {"role": "system",
+         "content": (f"{_PERSONA}\n\nCurrent state:\n{grounding}\n\n"
+                     "Combine the tool results below into ONE short, plain answer to "
+                     "the user. Mention each area briefly; skip empty ones.\n\n"
+                     f"Tool results:\n{blob}")},
+        {"role": "user", "content": user_message},
+    ]
+    msg = _model_chat(messages)
+    reply = _clean(msg.content) if msg else None
+    return reply or "Here's what I found across your tools."
 
 
 # --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
-def chat(message):
-    """Process one user turn; returns {reply, action, results}."""
+def chat_events(message, session_id=None):
+    """Process one user turn as a stream of events on a chat session.
+
+    Yields progress events `{"stage": "<label>"}` as the pipeline works, then exactly
+    one terminal event `{"final": {reply, action, results, modules, changed}}`. The
+    chat() wrapper drains this for non-streaming callers; the streaming HTTP route
+    relays every event so the UI can show a live timeline.
+    """
+    def final(reply, action, results, modules=None, changed=False):
+        return {"final": {"reply": reply, "action": action, "results": results,
+                          "modules": modules or [], "changed": changed}}
+
     text = str(message or "").strip()
     if not text:
-        return {"reply": "What would you like to do? You can ask about your budget, "
-                         "calendar, checklist, or habits.",
-                "action": "empty", "results": []}
+        yield final("What would you like to do? You can ask about your budget, "
+                    "calendar, checklist, or habits.", "empty", [])
+        return
 
     store = _load_store()
-    _record(store, "user", text)
+    session = _get_session(store, session_id)
+    _record(session, "user", text)
 
     # 1) Resolve an outstanding confirmation first.
-    resolved = _resolve_pending(store, text)
+    resolved = _resolve_pending(session, text)
     if resolved is not None:
-        _record(store, "assistant", resolved["reply"])
+        yield {"stage": "Confirming action"}
+        _record(session, "assistant", resolved["reply"])
         _save_store(store)
-        return resolved
+        yield final(resolved["reply"], resolved["action"], resolved["results"],
+                    resolved["modules"], resolved["changed"])
+        return
 
-    # 2) Route: stage 1 (module or direct answer) -> stage 2 (act).
+    # 2) Route: stage 1 (which modules?) -> stage 2 per module -> synthesize.
+    yield {"stage": "Reading your data"}
     grounding = _grounding()
-    module_name, direct = _stage1(text, grounding)
 
-    if module_name is None and direct is None:
+    yield {"stage": "Detecting tool usage"}
+    modules, direct = _stage1(text, grounding)
+
+    if not modules and direct is None:
         # Model runtime unreachable.
-        _record(store, "assistant", _HELP)
+        _record(session, "assistant", _HELP)
         _save_store(store)
-        return {"reply": _HELP, "action": "fallback", "results": []}
+        yield final(_HELP, "fallback", [])
+        return
 
-    if module_name is None:
-        _record(store, "assistant", direct)
+    if not modules:
+        yield {"stage": "Generating reply"}
+        _record(session, "assistant", direct)
         _save_store(store)
-        return {"reply": direct, "action": "answered", "results": []}
+        yield final(direct, "answered", [])
+        return
 
-    reply, action, results, pending = _stage2(module_name, text, grounding)
-    store["pending"] = pending
-    _record(store, "assistant", reply)
+    all_results = []
+    collected = []          # (module, results) for synthesis
+    per_module_reply = None
+    changed = False
+    acted = []
+    for module_name in modules:
+        yield {"stage": f"Checking {module_name}"}
+        m_reply = m_results = m_pending = None
+        m_wrote = False
+        for ev in _stage2_events(module_name, text, grounding):
+            if ev[0] == "stage":
+                yield {"stage": ev[1]}
+            else:
+                _, m_reply, m_action, m_results, m_pending, m_wrote = ev
+        acted.append(module_name)
+        all_results.extend(m_results or [])
+        collected.append((module_name, m_results or []))
+        per_module_reply = m_reply
+        changed = changed or m_wrote
+        # A destructive step pauses the whole turn immediately.
+        if m_pending is not None:
+            session["pending"] = m_pending
+            _record(session, "assistant", m_reply)
+            _save_store(store)
+            yield final(m_reply, "needs_confirmation", all_results, acted, changed)
+            return
+
+    session["pending"] = None
+    if len(acted) > 1:
+        yield {"stage": "Composing summary"}
+        reply = _synthesize(text, grounding, collected)
+    else:
+        reply = per_module_reply or "Done."
+    _record(session, "assistant", reply)
     _save_store(store)
-    return {"reply": reply, "action": action, "results": results}
+    yield final(reply, "tool_ok", all_results, acted, changed)
 
 
-def history(limit=30):
-    """Recent conversation, oldest-first, capped to `limit`."""
+def chat(message, session_id=None):
+    """Process one user turn; returns the final envelope. Thin wrapper over
+    chat_events() for non-streaming callers (tests, the plain JSON route)."""
+    result = {"reply": "", "action": "error", "results": [], "modules": [],
+              "changed": False}
+    for ev in chat_events(message, session_id):
+        if "final" in ev:
+            result = ev["final"]
+    return result
+
+
+def history(limit=30, session_id=None):
+    """Recent conversation for a session, oldest-first, capped to `limit`."""
     store = _load_store()
+    session = _get_session(store, session_id)
     try:
         limit = max(1, int(limit))
     except (TypeError, ValueError):
         limit = 30
-    return {"history": store["history"][-limit:]}
+    return {"session_id": session["id"], "history": session["history"][-limit:]}
 
 
-def clear_history():
-    _save_store({"history": [], "pending": None})
-    return {"ok": True}
+def clear_history(session_id=None):
+    """Wipe a single session's history + pending (keeps the session itself)."""
+    store = _load_store()
+    session = _get_session(store, session_id)
+    session["history"] = []
+    session["pending"] = None
+    session["title"] = "New chat"
+    _save_store(store)
+    return {"ok": True, "session_id": session["id"]}
+
+
+# --------------------------------------------------------------------------- #
+# Session management
+# --------------------------------------------------------------------------- #
+def _session_summary(sess):
+    return {"id": sess["id"], "title": sess.get("title") or "New chat",
+            "created_at": sess.get("created_at"), "updated_at": sess.get("updated_at"),
+            "count": len(sess.get("history", []))}
+
+
+def list_sessions():
+    """All sessions (newest-updated first) + the active id."""
+    store = _load_store()
+    sessions = sorted(store["sessions"], key=lambda s: s.get("updated_at", ""),
+                      reverse=True)
+    return {"active_id": store["active_id"],
+            "sessions": [_session_summary(s) for s in sessions]}
+
+
+def new_session():
+    """Create a fresh session and make it active."""
+    store = _load_store()
+    sess = _blank_session()
+    store["sessions"].append(sess)
+    store["active_id"] = sess["id"]
+    _save_store(store)
+    return {"ok": True, "session": _session_summary(sess)}
+
+
+def switch_session(session_id):
+    store = _load_store()
+    if session_id not in {s["id"] for s in store["sessions"]}:
+        return {"ok": False, "error": "no such session"}
+    store["active_id"] = session_id
+    _save_store(store)
+    return {"ok": True, "active_id": session_id}
+
+
+def rename_session(session_id, title):
+    store = _load_store()
+    title = str(title or "").strip()
+    if not title:
+        return {"ok": False, "error": "title is required"}
+    for sess in store["sessions"]:
+        if sess["id"] == session_id:
+            sess["title"] = title[:60]
+            _save_store(store)
+            return {"ok": True, "session": _session_summary(sess)}
+    return {"ok": False, "error": "no such session"}
+
+
+def delete_session(session_id):
+    store = _load_store()
+    before = len(store["sessions"])
+    store["sessions"] = [s for s in store["sessions"] if s["id"] != session_id]
+    if len(store["sessions"]) == before:
+        return {"ok": False, "error": "no such session"}
+    if not store["sessions"]:                      # never leave zero sessions
+        store["sessions"] = [_blank_session()]
+    if store["active_id"] == session_id:
+        store["active_id"] = store["sessions"][0]["id"]
+    _save_store(store)
+    return {"ok": True, "active_id": store["active_id"]}

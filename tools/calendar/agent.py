@@ -102,8 +102,11 @@ When to use:
 - User mentions scheduling, an appointment, meeting, deadline, "what's on my day",
   "am I free", or asks to add/move/cancel something dated.
 Factors before writing:
-- Resolve relative dates ("tomorrow", "next Fri") to an absolute YYYY-MM-DD before
-  calling add_event/update_event.
+- Resolve relative dates ("tomorrow", "next Fri", "today") to an absolute YYYY-MM-DD
+  before calling add_event/update_event (use the current date from the context).
+- ALWAYS pass `time` when the user gives a clock time, converted to 24-hour HH:MM:
+  "4:38pm" -> "16:38", "9am" -> "09:00", "noon" -> "12:00". Leave `time` blank only for
+  genuinely all-day events.
 - priority is one of low/med/high; default med if unstated.
 - Read list_events() first to check conflicts or find the item to edit/delete.
 - Indexes come from list_events() output order (sorted by date).
@@ -134,7 +137,7 @@ TOOLS = [
             "properties": {
                 "title": {"type": "string"},
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
-                "time": {"type": "string", "description": "HH:MM, blank = all-day"},
+                "time": {"type": "string", "description": "24-hour HH:MM (convert '4:38pm'->'16:38'); blank = all-day"},
                 "description": {"type": "string"},
                 "priority": {"type": "string", "enum": list(_PRIORITIES)},
                 "duration": {"type": "string", "description": "Free text, e.g. 2h"},
@@ -153,7 +156,7 @@ TOOLS = [
                 "index": {"type": "integer", "minimum": 0},
                 "title": {"type": "string"},
                 "date": {"type": "string"},
-                "time": {"type": "string", "description": "HH:MM, blank = all-day"},
+                "time": {"type": "string", "description": "24-hour HH:MM (convert '4:38pm'->'16:38'); blank = all-day"},
                 "description": {"type": "string"},
                 "priority": {"type": "string", "enum": list(_PRIORITIES)},
                 "duration": {"type": "string"},

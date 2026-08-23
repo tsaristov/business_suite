@@ -1,7 +1,7 @@
 {# Assistant tool UI fragment. Rendered inside the Flask app's Assistant tab
-   (see templates/index.html). A chat panel that talks to the Ollama-backed engine
-   via /api/assistant/*, with browser speech-to-text (mic) and text-to-speech.
-   Self-contained: Bootstrap 5.3 is already loaded by index.html. #}
+   (see templates/index.html). A chat panel with a session sidebar that talks to the
+   Ollama-backed engine via /api/assistant/*, with browser speech-to-text (mic) and
+   text-to-speech. Self-contained: Bootstrap 5.3 is already loaded by index.html. #}
 
 <style>
   #asst-log { height: 460px; overflow-y: auto; background: #f8f9fa;
@@ -17,40 +17,61 @@
   .asst-replay { cursor: pointer; font-size: .8rem; opacity: .55; margin-left: .35rem; }
   .asst-replay:hover { opacity: 1; }
   #asst-mic.listening { background: #e53935; color: #fff; border-color: #e53935; }
-  .asst-typing .asst-bubble { color: #6c757d; font-style: italic; }
+  .asst-typing .asst-bubble { color: #6c757d; }
+  .asst-timeline { font-size: .85rem; }
+  .asst-tl-line { display: flex; align-items: center; gap: .4rem; padding: .1rem 0; }
+  .asst-tl-line .ti { width: 1rem; text-align: center; }
+  .asst-tl-line.done { color: #198754; }
+  .asst-tl-line.current { color: #6c757d; }
+  .asst-tl-line.current .ti { animation: asst-pulse 1s ease-in-out infinite; }
+  @keyframes asst-pulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+  #asst-sessions .list-group-item { cursor: pointer; padding: .4rem .5rem; }
+  #asst-sessions .list-group-item.active { background: #0d6efd; border-color: #0d6efd; }
+  .asst-sess-title { min-width: 0; }
+  .asst-sess-btn { line-height: 1; text-decoration: none; }
 </style>
 
-<div class="d-flex justify-content-between align-items-center mb-2">
-  <div class="text-muted small">Local assistant — budget · calendar · checklist · habits</div>
-  <div>
-    <button id="asst-mute" class="btn btn-sm btn-outline-secondary" type="button"
-            title="Mute / unmute spoken replies">🔊</button>
-    <button id="asst-clear" class="btn btn-sm btn-outline-danger" type="button">Clear</button>
+<div class="row g-3">
+  <div class="col-md-3">
+    <button id="asst-new" class="btn btn-sm btn-primary w-100 mb-2" type="button">+ New Chat</button>
+    <div id="asst-sessions" class="list-group small"></div>
+  </div>
+
+  <div class="col-md-9">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div class="text-muted small">Local assistant — budget · calendar · checklist · habits</div>
+      <div>
+        <button id="asst-mute" class="btn btn-sm btn-outline-secondary" type="button"
+                title="Mute / unmute spoken replies">🔊</button>
+        <button id="asst-clear" class="btn btn-sm btn-outline-danger" type="button">Clear</button>
+      </div>
+    </div>
+
+    <div id="asst-log" aria-live="polite"></div>
+
+    <div class="input-group mt-3">
+      <button id="asst-mic" class="btn btn-outline-secondary" type="button"
+              title="Speak">🎤</button>
+      <input id="asst-input" class="form-control" placeholder="Ask or tell me something…"
+             autocomplete="off">
+      <button id="asst-send" class="btn btn-primary" type="button">Send</button>
+    </div>
+    <div id="asst-hint" class="form-text"></div>
   </div>
 </div>
 
-<div id="asst-log" aria-live="polite"></div>
-
-<div class="input-group mt-3">
-  <button id="asst-mic" class="btn btn-outline-secondary" type="button"
-          title="Speak">🎤</button>
-  <input id="asst-input" class="form-control" placeholder="Ask or tell me something…"
-         autocomplete="off">
-  <button id="asst-send" class="btn btn-primary" type="button">Send</button>
-</div>
-<div id="asst-hint" class="form-text"></div>
-
 <script>
 (function () {
-  const CHAT = "{{ url_for('assistant_chat') }}";
+  const STREAM = "{{ url_for('assistant_chat_stream') }}";
   const HISTORY = "{{ url_for('assistant_history') }}";
   const CLEAR = "{{ url_for('assistant_clear_history') }}";
+  const SESSIONS = "{{ url_for('assistant_sessions') }}";   // GET list / POST new
   const $ = (id) => document.getElementById(id);
 
   const log = $("asst-log");
   const input = $("asst-input");
   let muted = false;
-  let loaded = false;
+  let activeId = null;
 
   // --- rendering -----------------------------------------------------------
   function scroll() { log.scrollTop = log.scrollHeight; }
@@ -75,17 +96,46 @@
     return row;
   }
 
-  function showTyping() {
-    const row = addBubble("assistant", "…thinking");
-    row.classList.add("asst-typing");
-    return row;
+  // A live progress timeline: each new stage marks the previous one done (✓) and
+  // shows itself as the current (pulsing) step.
+  function showTimeline() {
+    const row = document.createElement("div");
+    row.className = "asst-row assistant asst-typing";
+    const bubble = document.createElement("div");
+    bubble.className = "asst-bubble";
+    const list = document.createElement("div");
+    list.className = "asst-timeline";
+    bubble.appendChild(list);
+    row.appendChild(bubble);
+    log.appendChild(row);
+    scroll();
+    return {
+      row,
+      step(label) {
+        const prev = list.lastElementChild;
+        if (prev) {
+          prev.classList.replace("current", "done");
+          prev.querySelector(".ti").textContent = "✓";
+        }
+        const line = document.createElement("div");
+        line.className = "asst-tl-line current";
+        const icon = document.createElement("span");
+        icon.className = "ti";
+        icon.textContent = "●";
+        const txt = document.createElement("span");
+        txt.textContent = label;
+        line.appendChild(icon);
+        line.appendChild(txt);
+        list.appendChild(line);
+        scroll();
+      },
+    };
   }
 
   // --- text to speech ------------------------------------------------------
   function speak(text) {
     if (muted || !("speechSynthesis" in window)) return;
     window.speechSynthesis.cancel();
-    // Strip markdown-ish characters for cleaner audio.
     const clean = String(text).replace(/[*_`#>]/g, "");
     const u = new SpeechSynthesisUtterance(clean);
     const voice = window.speechSynthesis.getVoices()
@@ -94,26 +144,117 @@
     window.speechSynthesis.speak(u);
   }
 
-  // --- send a turn ---------------------------------------------------------
+  // --- sessions sidebar ----------------------------------------------------
+  async function loadSessions() {
+    try {
+      const res = await fetch(SESSIONS);
+      const data = await res.json();
+      activeId = data.active_id;
+      const box = $("asst-sessions");
+      box.innerHTML = "";
+      (data.sessions || []).forEach((s) => {
+        const item = document.createElement("div");
+        item.className = "list-group-item d-flex align-items-center gap-1"
+          + (s.id === activeId ? " active" : "");
+        const title = document.createElement("span");
+        title.className = "asst-sess-title flex-grow-1 text-truncate";
+        title.textContent = s.title || "New chat";
+        title.title = s.title || "New chat";
+        title.addEventListener("click", () => switchSession(s.id));
+        const ren = document.createElement("a");
+        ren.className = "asst-sess-btn"; ren.href = "#"; ren.textContent = "✎";
+        ren.title = "Rename";
+        ren.addEventListener("click", (e) => { e.preventDefault(); renameSession(s); });
+        const del = document.createElement("a");
+        del.className = "asst-sess-btn text-danger"; del.href = "#"; del.textContent = "🗑";
+        del.title = "Delete";
+        del.addEventListener("click", (e) => { e.preventDefault(); deleteSession(s); });
+        item.append(title, ren, del);
+        box.appendChild(item);
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  async function switchSession(id) {
+    if (id === activeId) return;
+    await fetch(SESSIONS + "/" + id + "/activate", { method: "POST" });
+    activeId = id;
+    await loadSessions();
+    await loadHistory();
+  }
+
+  async function newSession() {
+    const res = await fetch(SESSIONS, { method: "POST" });
+    const data = await res.json();
+    if (data.session) activeId = data.session.id;
+    await loadSessions();
+    await loadHistory();
+    input.focus();
+  }
+
+  async function renameSession(s) {
+    const title = window.prompt("Rename chat:", s.title || "");
+    if (title == null || !title.trim()) return;
+    await fetch(SESSIONS + "/" + s.id + "/rename", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: title.trim() }),
+    });
+    loadSessions();
+  }
+
+  async function deleteSession(s) {
+    if (!window.confirm("Delete this chat? This can't be undone.")) return;
+    const res = await fetch(SESSIONS + "/" + s.id, { method: "DELETE" });
+    const data = await res.json();
+    if (data.active_id) activeId = data.active_id;
+    await loadSessions();
+    await loadHistory();
+  }
+
+  // --- send a turn (streamed) ----------------------------------------------
   async function send(text) {
     text = (text != null ? text : input.value).trim();
     if (!text) return;
     input.value = "";
     addBubble("user", text);
-    const typing = showTyping();
+    const timeline = showTimeline();
+    timeline.step("Sending…");
     try {
-      const res = await fetch(CHAT, {
+      const res = await fetch(STREAM, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, session_id: activeId }),
       });
-      const data = await res.json();
-      typing.remove();
-      const reply = data.reply || "(no reply)";
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let envelope = null;
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, nl).trim();
+          buf = buf.slice(nl + 1);
+          if (!line) continue;
+          const ev = JSON.parse(line);
+          if (ev.stage) timeline.step(ev.stage);
+          else if (ev.final) envelope = ev.final;
+        }
+      }
+      timeline.row.remove();
+      const reply = (envelope && envelope.reply) || "(no reply)";
       addBubble("assistant", reply);
       speak(reply);
+      // Auto-refresh any tool tab the assistant just changed.
+      if (envelope && envelope.changed && Array.isArray(envelope.modules)) {
+        envelope.modules.forEach((m) => window.refreshTab && window.refreshTab(m));
+      }
+      loadSessions();   // title/order may have changed
     } catch (e) {
-      typing.remove();
+      timeline.row.remove();
       const msg = "Sorry — I couldn't reach the assistant.";
       addBubble("assistant", msg);
       speak(msg);
@@ -122,11 +263,10 @@
 
   // --- history -------------------------------------------------------------
   async function loadHistory() {
-    if (loaded) return;
-    loaded = true;
     try {
-      const res = await fetch(HISTORY);
+      const res = await fetch(HISTORY + (activeId ? "?session_id=" + activeId : ""));
       const data = await res.json();
+      activeId = data.session_id || activeId;
       log.innerHTML = "";
       (data.history || []).forEach((h) =>
         addBubble(h.role === "user" ? "user" : "assistant", h.message));
@@ -139,10 +279,13 @@
   }
 
   async function clearHistory() {
-    await fetch(CLEAR, { method: "POST" });
-    log.innerHTML = "";
-    loaded = false;
-    loadHistory();
+    await fetch(CLEAR, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: activeId }),
+    });
+    await loadHistory();
+    loadSessions();
   }
 
   // --- speech to text ------------------------------------------------------
@@ -155,29 +298,68 @@
       hint.textContent = "Voice input isn't supported in this browser — type instead.";
       return;
     }
+    if (!window.isSecureContext) {
+      mic.style.display = "none";
+      hint.textContent = "Voice needs a secure origin — open via http://localhost or "
+        + "127.0.0.1 (or HTTPS).";
+      return;
+    }
     const recog = new SR();
     recog.lang = "en-US";
+    recog.continuous = false;
     recog.interimResults = false;
     recog.maxAlternatives = 1;
     let listening = false;
+    let gotError = false;   // so `end` (which always follows `error`) keeps the message
+    let gotResult = false;  // distinguish "heard nothing" from a real failure
+    let retriedNetwork = false;  // one auto-retry on a transient network error
+
+    const ERRORS = {
+      "not-allowed": "Microphone blocked. Allow mic access for this site (padlock "
+        + "icon → Site settings), then reload.",
+      "service-not-allowed": "Speech service blocked by the browser or OS. Note: "
+        + "Brave/Edge/Arc strip Google's speech key — use Chrome for voice input.",
+      "network": "Speech recognition couldn't reach Google's service. This usually "
+        + "means the browser (Brave/Edge/Arc block it) — use Chrome, or type instead.",
+      "audio-capture": "No microphone found. Check that one is connected and enabled.",
+      "no-speech": "Didn't hear anything — tap the mic and speak.",
+      "aborted": "Listening was interrupted. Try again.",
+    };
+
+    function start() {
+      gotError = false; gotResult = false;
+      try { recog.start(); }
+      catch (e) { console.error("[assistant] recog.start:", e); }
+    }
 
     mic.addEventListener("click", () => {
       if (listening) { recog.stop(); return; }
-      try { recog.start(); } catch (e) { /* already starting */ }
+      retriedNetwork = false;
+      start();
     });
     recog.addEventListener("start", () => {
-      listening = true; mic.classList.add("listening"); hint.textContent = "Listening…";
-    });
-    recog.addEventListener("end", () => {
-      listening = false; mic.classList.remove("listening"); hint.textContent = "";
+      listening = true; gotError = false; mic.classList.add("listening");
+      hint.textContent = "Listening… speak now.";
     });
     recog.addEventListener("error", (e) => {
+      console.error("[assistant] speech error:", e.error, e);
+      // A transient network error on the first attempt often clears on one retry.
+      if (e.error === "network" && !retriedNetwork) {
+        retriedNetwork = true;
+        hint.textContent = "Reconnecting…";
+        setTimeout(start, 400);
+        return;
+      }
+      gotError = true; listening = false; mic.classList.remove("listening");
+      hint.textContent = ERRORS[e.error] || ("Voice error: " + e.error);
+    });
+    recog.addEventListener("end", () => {
       listening = false; mic.classList.remove("listening");
-      hint.textContent = e.error === "not-allowed"
-        ? "Microphone permission denied."
-        : "Didn't catch that — try again or type.";
+      if (!gotError && !gotResult) hint.textContent = "Didn't catch that — try again.";
+      else if (!gotError) hint.textContent = "";
     });
     recog.addEventListener("result", (e) => {
+      gotResult = true;
       const text = e.results[0][0].transcript;
       input.value = text;
       send(text);
@@ -193,12 +375,11 @@
     if (muted && "speechSynthesis" in window) window.speechSynthesis.cancel();
   });
   $("asst-clear").addEventListener("click", clearHistory);
+  $("asst-new").addEventListener("click", newSession);
   setupMic();
 
-  // Populate voices (some browsers load them async) + load history now and on show.
   if ("speechSynthesis" in window) window.speechSynthesis.getVoices();
+  loadSessions();
   loadHistory();
-  document.querySelectorAll('[data-bs-target="#assistant"]').forEach((btn) =>
-    btn.addEventListener("shown.bs.tab", loadHistory));
 })();
 </script>

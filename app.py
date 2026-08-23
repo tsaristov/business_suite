@@ -5,11 +5,12 @@ Run: python app.py  ->  http://127.0.0.1:5000
 """
 
 import importlib.util
+import json
 import os
 import re
 from datetime import date, datetime, timedelta
 
-from flask import Flask, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
 from jinja2 import ChoiceLoader, FileSystemLoader
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -62,25 +63,43 @@ def _budget_context():
     }
 
 
-def _habits_context(days=49):
-    """Habit list enriched for the UI: today-status, streak, and a completion
-    heatmap grid over the last `days` days (49 = 7 weeks, renders 7 per row)."""
+def _habits_context(weeks=16):
+    """Habit list enriched for the UI: today-status, streak, and a GitHub-style
+    completion heatmap. Returns {habits, month_labels}: each habit has `columns`
+    (one per week, each a list of 7 day cells Sun→Sat); month_labels align to columns
+    so every completed day in the window shows as a filled cell."""
     today = date.today()
-    # Newest first: today lands top-left, oldest day bottom-right.
-    window = [today - timedelta(days=i) for i in range(days)]
+    # Sunday-aligned columns. weekday(): Mon=0..Sun=6 -> days since the last Sunday.
+    days_since_sun = (today.weekday() + 1) % 7
+    this_week_start = today - timedelta(days=days_since_sun)
+    col_starts = [this_week_start - timedelta(weeks=weeks - 1 - w)
+                  for w in range(weeks)]
+
+    month_labels, last_month = [], None
+    for cs in col_starts:
+        month_labels.append(cs.strftime("%b") if cs.month != last_month else "")
+        last_month = cs.month
+
     out = []
     for h in habits.load():
         done = habits.completion_dates(h)
+        columns = []
+        for cs in col_starts:
+            cells = []
+            for d in range(7):
+                day = cs + timedelta(days=d)
+                iso = day.isoformat()
+                cells.append({"date": iso, "done": iso in done, "future": day > today})
+            columns.append(cells)
         out.append({
             "name": h["name"],
             "total": len(h.get("completions", [])),
             "done_today": today.isoformat() in done,
             "streak": habits.streak(h, today),
             "last": h["completions"][-1] if h.get("completions") else None,
-            "grid": [{"date": d.isoformat(), "done": d.isoformat() in done}
-                     for d in window],
+            "columns": columns,
         })
-    return out
+    return {"habits": out, "month_labels": month_labels}
 
 
 @app.route("/")
@@ -371,17 +390,62 @@ def habits_complete(idx):
 @app.route("/api/assistant/chat", methods=["POST"])
 def assistant_chat():
     payload = request.get_json(silent=True) or {}
-    return jsonify(assistant.chat(payload.get("message", "")))
+    return jsonify(assistant.chat(payload.get("message", ""),
+                                  payload.get("session_id")))
+
+
+@app.route("/api/assistant/chat/stream", methods=["POST"])
+def assistant_chat_stream():
+    """Stream the turn as newline-delimited JSON events: {stage} … then {final}.
+    Lets the UI show a live progress timeline instead of a static 'thinking'."""
+    payload = request.get_json(silent=True) or {}
+    message = payload.get("message", "")
+    session_id = payload.get("session_id")
+
+    def emit():
+        for event in assistant.chat_events(message, session_id):
+            yield json.dumps(event) + "\n"
+
+    return Response(emit(), mimetype="application/x-ndjson")
 
 
 @app.route("/api/assistant/history", methods=["GET"])
 def assistant_history():
-    return jsonify(assistant.history(request.args.get("limit", 30)))
+    return jsonify(assistant.history(request.args.get("limit", 30),
+                                     request.args.get("session_id")))
 
 
 @app.route("/api/assistant/clear-history", methods=["POST"])
 def assistant_clear_history():
-    return jsonify(assistant.clear_history())
+    payload = request.get_json(silent=True) or {}
+    return jsonify(assistant.clear_history(payload.get("session_id")))
+
+
+# Session management (sidebar: list / new / switch / rename / delete).
+@app.route("/api/assistant/sessions", methods=["GET"])
+def assistant_sessions():
+    return jsonify(assistant.list_sessions())
+
+
+@app.route("/api/assistant/sessions", methods=["POST"])
+def assistant_session_new():
+    return jsonify(assistant.new_session())
+
+
+@app.route("/api/assistant/sessions/<sid>/activate", methods=["POST"])
+def assistant_session_activate(sid):
+    return jsonify(assistant.switch_session(sid))
+
+
+@app.route("/api/assistant/sessions/<sid>/rename", methods=["POST"])
+def assistant_session_rename(sid):
+    payload = request.get_json(silent=True) or {}
+    return jsonify(assistant.rename_session(sid, payload.get("title", "")))
+
+
+@app.route("/api/assistant/sessions/<sid>", methods=["DELETE"])
+def assistant_session_delete(sid):
+    return jsonify(assistant.delete_session(sid))
 
 
 if __name__ == "__main__":

@@ -104,16 +104,19 @@ Each turn is processed as an ordered sequence (`engine.chat(message)`):
    *before* any model call.
 4. **Assemble grounding.** Build a compact, capped state summary from the four stores
    (Section 5).
-5. **Stage 1 — route or answer.** One model call offering the single `select_module`
-   tool. If the model calls it → proceed to stage 2 with that module. If it answers in
-   text instead → return that grounded reply (`action="answered"`). If the runtime is
-   unreachable → static help (`action="fallback"`).
-6. **Stage 2 — act.** A second call offering only the chosen module's tools; run a
-   bounded tool-use loop (≤4 hops), dispatching each tool call through the module's
-   `execute()` and feeding results back until the model returns a final sentence.
-   - Any `needs_confirmation` result **pauses** the turn: store the pending action and
-     return a yes/no prompt (`action="needs_confirmation"`).
-7. **Reply.** Record the assistant reply and return the response envelope (Section 8).
+5. **Stage 1 — route or answer.** One model call offering the `select_modules` tool.
+   The model returns the relevant module(s). A deterministic **overview** detector forces
+   `calendar+checklist+habits` for broad "what's my day" queries. No modules + a text
+   answer → grounded reply (`action="answered"`); runtime unreachable → static help
+   (`action="fallback"`).
+6. **Stage 2 — act (per module).** For each selected module, a call offering only that
+   module's tools; run a bounded tool-use loop (≤4 hops), dispatching each tool call
+   through `execute()` and feeding results back. Results accumulate across modules.
+   - Any `needs_confirmation` result **pauses** the whole turn: store the pending action
+     and return a yes/no prompt (`action="needs_confirmation"`).
+7. **Synthesize & reply.** For a multi-module turn, one final call combines all tool
+   results into a single reply (`Composing summary`); single-module turns use that
+   module's reply directly. Record it and return the envelope (Section 8).
 
 ---
 
@@ -122,26 +125,29 @@ Each turn is processed as an ordered sequence (`engine.chat(message)`):
 The engine defines **no tools of its own**. It reads capabilities from each module's
 `describe()` and routes in two stages so a small model never faces all ~29 tools at once.
 
-### 4.1 Stage 1 — module selection
+### 4.1 Stage 1 — module selection (one or many)
 
 The model is offered exactly one tool:
 
 ```
-select_module(module: enum["budget","calendar","checklist","habits"])
+select_modules(modules: array<enum["budget","calendar","checklist","habits"]>)
 ```
 
-Instruction: call it to **change data** or fetch **exact records**; otherwise just
-answer from the grounding summary. This means broad, read-only questions
-("how's my month going?") are answered in a single call from grounding, while any write
-or precise lookup is routed to one module.
+Instruction: include **every** module the request touches — a day overview picks
+calendar + checklist + habits; a write picks the target module. An empty list ⇒ answer
+from grounding. Two deterministic safety-nets cover small-model misses: an **overview
+detector** (phrases like "what's my day", "agenda", "rundown") forces
+calendar+checklist+habits; a **keyword router** forces a single module when the model
+free-texts instead of routing, so writes are never silently dropped.
 
-### 4.2 Stage 2 — action selection & execution
+### 4.2 Stage 2 — action selection & execution (per module)
 
-The chosen module's `describe()["tools"]` are converted to Ollama function tools
-(`when_to_use` folded into the description) and offered alone. The model emits one or
-more tool calls; each is dispatched via `module.execute(name, args)` and the result is
-appended as a `tool` message. The loop repeats (≤4 hops) so the model can **read before
-it writes** (e.g. `list_events` to find an index, then `update_event`).
+Each selected module's `describe()["tools"]` are converted to Ollama function tools
+(`when_to_use` folded into the description) and offered alone. The model emits tool
+call(s); each is dispatched via `module.execute(name, args)` and the result appended as a
+`tool` message. The loop repeats (≤4 hops) so the model can **read before it writes**
+(e.g. `list_events` to find an index, then `update_event`). When more than one module
+ran, a final **synthesis** call merges their results into one reply.
 
 ### 4.3 Tool inventory (⚠️ = destructive, two-step confirm)
 
@@ -237,7 +243,9 @@ tool layer enforces. Calling `execute()` without `confirm=True` returns:
 | :--- | :--- |
 | `reply` | Short, spoken-quality sentence for display and TTS. |
 | `action` | Outcome code: `empty`, `answered`, `tool_ok`, `needs_confirmation`, `confirmed`, `canceled`, `fallback`. |
-| `results` | List of the raw module `execute()` result dict(s) (may be empty). |
+| `results` | List of the raw module `execute()` result dict(s) across all acted modules (may be empty). |
+| `modules` | List of modules acted on this turn (e.g. `["calendar","checklist","habits"]`). |
+| `changed` | True if a successful **write** ran — the UI uses this to auto-refresh those tabs. |
 
 Consumers tolerate extra module-specific fields inside `results` and the absence of any.
 
@@ -249,9 +257,24 @@ Served by `app.py`; consumed by `interface.html`.
 
 | Method | Path | Body | Response |
 | :--- | :--- | :--- | :--- |
-| POST | `/api/assistant/chat` | `{ message }` | The response envelope (Section 8). |
-| GET | `/api/assistant/history` | query `limit` (default 30) | `{ history: [ { role, message, created_at } … ] }`, oldest-first. |
-| POST | `/api/assistant/clear-history` | — | `{ ok: true }` |
+| POST | `/api/assistant/chat` | `{ message }` | The response envelope (Section 8). Non-streaming; drains `chat_events()` and returns the final. |
+| POST | `/api/assistant/chat/stream` | `{ message }` | **Streamed** newline-delimited JSON (`application/x-ndjson`): zero or more `{ "stage": "<label>" }` progress events, then one `{ "final": <envelope> }`. Message is in the POST body, never the URL. |
+| GET | `/api/assistant/history` | query `limit` (30), `session_id` | `{ session_id, history: [ { role, message, created_at } … ] }`, oldest-first. |
+| POST | `/api/assistant/clear-history` | `{ session_id }` | `{ ok, session_id }` (clears that session's history). |
+| GET | `/api/assistant/sessions` | — | `{ active_id, sessions: [ { id, title, created_at, updated_at, count } … ] }` (newest-updated first). |
+| POST | `/api/assistant/sessions` | — | Create a session, make it active: `{ ok, session }`. |
+| POST | `/api/assistant/sessions/<id>/activate` | — | `{ ok, active_id }`. |
+| POST | `/api/assistant/sessions/<id>/rename` | `{ title }` | `{ ok, session }`. |
+| DELETE | `/api/assistant/sessions/<id>` | — | `{ ok, active_id }` (never leaves zero sessions). |
+
+`chat` and `chat/stream` also accept an optional `session_id` in the body; omitted ⇒ the
+active session.
+
+**Progress stages** (order reflects the real pipeline): `Reading your data` →
+`Detecting tool usage` → per module `Checking <module>` → (`Deciding next step` ↔
+`Using <module>: <action>`)* → `Generating reply`; multi-module turns end with
+`Composing summary`; confirmation turns emit `Confirming action`. The chat UI renders
+these as a live timeline instead of a static "thinking".
 
 The chat UI fragment is served like every tool: `templates/index.html` includes
 `assistant/interface.html`, resolved by the Jinja `ChoiceLoader` (which now also sees
@@ -259,25 +282,35 @@ the project base dir, since the assistant lives outside `tools/`).
 
 ---
 
-## 10. Client Voice Interaction (STT / TTS)
+## 10. Client (sessions, voice, auto-refresh)
 
-`interface.html` is a self-contained Bootstrap chat fragment.
+`interface.html` is a self-contained Bootstrap fragment: a left **session sidebar** and
+the chat on the right.
+
+**Sessions.** The sidebar lists sessions (active highlighted), with **New Chat**, and
+per-item **rename** (✎) and **delete** (🗑). Selecting a session activates it and loads
+its history; each chat turn carries the active `session_id` and refreshes the list
+(titles auto-derive from the first message).
 
 **Speech input (STT).** `window.SpeechRecognition || webkitSpeechRecognition`,
 single-utterance, final-results. On a transcript the text fills the input and is sent.
-If unsupported, the mic hides and the user is told to type; a denied mic permission
-surfaces a clear message. (Reliable in Chrome/Edge; Firefox support is limited.)
+Guards: if unsupported the mic hides; a non-secure origin shows a "use localhost/HTTPS"
+message; each error code shows a persistent human message; a transient `network` error
+auto-retries once. **Caveat:** browser STT relies on Google's cloud — it works in Chrome
+proper but Brave/Edge/Arc and key-stripped Chromium builds always error `network`; the
+only fix there is local STT (not implemented).
 
-**Turn submission.** Text (typed, Enter, or from speech) is appended as a user bubble;
-a "thinking" placeholder shows; the turn is POSTed to `/api/assistant/chat`; the `reply`
-replaces the placeholder and is spoken. On network error an apology bubble is shown/spoken.
+**Turn submission.** POSTed to `/api/assistant/chat/stream`; the client reads the NDJSON
+stream and renders each `stage` as a **live progress timeline** (each stage marks the
+previous done ✓ and pulses as current). On `final` the timeline is replaced by the reply
+bubble, which is spoken. **Auto-refresh:** if `changed` is true, `window.refreshTab(m)`
+(defined in `index.html`) is called for each module in `modules` — it re-fetches that
+server-rendered pane and re-executes its scripts, so Calendar/Checklist/Habits/Budget
+update without a manual reload.
 
-**Speech output (TTS).** `speechSynthesis.speak()` on each assistant reply, with
-markdown characters stripped and a natural voice preferred when available. A mute toggle
-cancels in-progress speech; each assistant bubble has a replay control.
-
-**History.** Loaded oldest-first on tab show; a Clear button wipes server history and
-resets the chat to a greeting.
+**Speech output (TTS).** `speechSynthesis.speak()` on each reply, markdown stripped, a
+natural voice preferred. A mute toggle cancels in-progress speech; each bubble has a
+replay control.
 
 ---
 
@@ -287,12 +320,16 @@ The assistant **owns no domain tables** — each tool remains the source of trut
 own `data.json` (shapes: budget object; calendar/checklist/habits lists — see each
 `agent.py`). The assistant reads them for grounding and writes only via `execute()`.
 
-**assistant/data.json** (new, git-ignored by `**/data.json`):
+**assistant/data.json** (git-ignored by `**/data.json`) — multiple chat sessions:
 
 | Field | Notes |
 | :--- | :--- |
-| `history[]` | `{ role: "user"\|"assistant", message, created_at }`, ordered. |
-| `pending` | Single-slot confirmation `{ module, action, params, ts }`, or `null`. |
+| `sessions[]` | `{ id, title, created_at, updated_at, history: [{role, message, created_at}], pending }`. |
+| `active_id` | Id of the session used when a request omits `session_id`. |
+| `pending` (per session) | Single-slot confirmation `{ module, action, params, ts }`, or `null`. |
+
+An old single-conversation file (`{history, pending}`) is auto-migrated into one session
+on first load.
 
 ---
 
