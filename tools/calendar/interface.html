@@ -1,0 +1,35 @@
+{# Calendar tool UI fragment. Rendered inside the Flask app's Calendar tab
+   (see templates/index.html). Context: `events` = list of event dicts. #}
+<form class="row g-2 align-items-end my-3" method="post" action="{{ url_for('calendar_add') }}">
+  <div class="col-md-3"><label class="form-label">Title</label>
+    <input name="title" class="form-control" required></div>
+  <div class="col-md-3"><label class="form-label">Description</label>
+    <input name="description" class="form-control"></div>
+  <div class="col-auto"><label class="form-label">Priority</label>
+    <select name="priority" class="form-select">
+      <option>low</option><option>med</option><option>high</option>
+    </select></div>
+  <div class="col-auto"><label class="form-label">Date</label>
+    <input name="date" type="date" class="form-control"></div>
+  <div class="col-auto"><label class="form-label">Duration</label>
+    <input name="duration" class="form-control" placeholder="2h"></div>
+  <div class="col-auto"><button class="btn btn-primary">Add</button></div>
+</form>
+<table class="table table-sm table-striped">
+  <thead><tr><th>Date</th><th>Title</th><th>Priority</th><th>Duration</th><th>Description</th><th></th></tr></thead>
+  <tbody>
+  {% for e in events %}
+    <tr>
+      <td>{{ e.date }}</td><td>{{ e.title }}</td><td>{{ e.priority }}</td>
+      <td>{{ e.duration }}</td><td>{{ e.description }}</td>
+      <td class="text-end">
+        <form method="post" action="{{ url_for('calendar_delete', idx=loop.index0) }}">
+          <button class="btn btn-sm btn-outline-danger">Delete</button>
+        </form>
+      </td>
+    </tr>
+  {% else %}
+    <tr><td colspan="6" class="text-muted">No events yet.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>

@@ -1,0 +1,23 @@
+{# Habits tool UI fragment. Rendered inside the Flask app's Habits tab
+   (see templates/index.html). Context: `habits` = list of habit dicts. #}
+<form class="row g-2 align-items-end my-3" method="post" action="{{ url_for('habits_add') }}">
+  <div class="col-md-4"><label class="form-label">Habit name</label>
+    <input name="name" class="form-control" required></div>
+  <div class="col-auto"><button class="btn btn-primary">Add</button></div>
+</form>
+<ul class="list-group">
+  {% for h in habits %}
+    <li class="list-group-item d-flex justify-content-between align-items-center">
+      <span>
+        <strong>{{ h.name }}</strong>
+        <span class="badge bg-info text-dark">{{ h.completions|length }} done</span>
+        <span class="text-muted">last: {{ h.completions[-1] if h.completions else 'never' }}</span>
+      </span>
+      <form method="post" action="{{ url_for('habits_complete', idx=loop.index0) }}">
+        <button class="btn btn-sm btn-outline-success">Mark complete</button>
+      </form>
+    </li>
+  {% else %}
+    <li class="list-group-item text-muted">No habits yet.</li>
+  {% endfor %}
+</ul>

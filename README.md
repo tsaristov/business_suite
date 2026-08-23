@@ -22,12 +22,21 @@ _Setup and build instructions to be added as the project takes shape._
 ```
 custom_business_suite/
 ├── README.md
+├── app.py                  # Flask web UI (tabs pull each tool's interface.html)
+├── requirements.txt
+├── templates/
+│   └── index.html          # app shell; includes tools/<name>/interface.html per tab
 ├── assistant/
-├── budget/
-├── calendar/
-├── checklist/
-└── habits/
+└── tools/
+    ├── budget/             # budget.py (CLI) · agent.py (AI tool layer) · interface.html
+    ├── calendar/
+    ├── checklist/
+    └── habits/
 ```
+
+Each tool folder is self-contained: a CLI script, an `agent.py` capability layer for
+the assistant, an `interface.html` UI fragment for the web app, and its own
+`data.json` store (shared across all three).
 
 ## Project Modules
 All of the projects can sync together using the assistant.

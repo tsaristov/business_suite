@@ -9,13 +9,15 @@ import os
 from datetime import date, datetime
 
 from flask import Flask, redirect, render_template, request, url_for
+from jinja2 import ChoiceLoader, FileSystemLoader
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+TOOLS_DIR = os.path.join(BASE, "tools")
 
 
 def _load_module(name, *parts):
     """Load a module by file path under a unique name (avoids stdlib shadowing)."""
-    path = os.path.join(BASE, *parts)
+    path = os.path.join(TOOLS_DIR, *parts)
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -28,6 +30,10 @@ checklist = _load_module("checklist_mod", "checklist", "checklist.py")
 habits = _load_module("habits_mod", "habits", "habits.py")
 
 app = Flask(__name__)
+
+# Let templates/index.html include each tool's own UI at <tool>/interface.html
+# (e.g. {% include 'budget/interface.html' %}), resolved from the tools/ dir.
+app.jinja_loader = ChoiceLoader([app.jinja_loader, FileSystemLoader(TOOLS_DIR)])
 
 
 @app.route("/")

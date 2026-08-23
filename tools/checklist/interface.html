@@ -1,0 +1,31 @@
+{# Checklist tool UI fragment. Rendered inside the Flask app's Checklist tab
+   (see templates/index.html). Context: `items` = list of item dicts. #}
+<form class="row g-2 align-items-end my-3" method="post" action="{{ url_for('checklist_add') }}">
+  <div class="col-md-4"><label class="form-label">Item</label>
+    <input name="item" class="form-control" required></div>
+  <div class="col"><label class="form-label">Description</label>
+    <input name="description" class="form-control"></div>
+  <div class="col-auto"><label class="form-label">Priority</label>
+    <select name="priority" class="form-select">
+      <option>low</option><option>med</option><option>high</option>
+    </select></div>
+  <div class="col-auto"><button class="btn btn-primary">Add</button></div>
+</form>
+<ul class="list-group">
+  {% for it in items %}
+    <li class="list-group-item d-flex justify-content-between align-items-center">
+      <span class="{{ 'text-decoration-line-through text-muted' if it.done }}">
+        <strong>{{ it.item }}</strong>
+        <span class="badge bg-secondary">{{ it.priority }}</span>
+        <span class="text-muted">{{ it.description }}</span>
+      </span>
+      <form method="post" action="{{ url_for('checklist_done', idx=loop.index0) }}">
+        <button class="btn btn-sm {{ 'btn-outline-secondary' if it.done else 'btn-outline-success' }}">
+          {{ 'Undo' if it.done else 'Done' }}
+        </button>
+      </form>
+    </li>
+  {% else %}
+    <li class="list-group-item text-muted">List empty.</li>
+  {% endfor %}
+</ul>
