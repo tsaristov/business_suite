@@ -39,7 +39,10 @@ the assistant, an `interface.html` UI fragment for the web app, and its own
 `data.json` store (shared across all three).
 
 ## Project Tools
-All of the projects can sync together using the assistant.
+The core behind the project is a modular system for business owneres to be able to access
+and utilize the tools in place for them to grow themselves and their buisness. This is all
+tied together by an AI assistant, that can act as a secretary, managing all of the details,
+leaving room for people to grow and expand their own goals.
 
 ### Assistant
 An LLM powered AI assistant with RAG context, tool usage, and agentic capabilities. It
@@ -48,6 +51,8 @@ sits on top of every other tool, reading their data for context and calling thei
 budget, calendar, checklist, and habits through natural language instead of each tool's
 own interface. This is the layer that lets the otherwise independent tools sync and work
 together as one system.
+
+``` This has not been built out yet ```
 
 ### Budget
 A budget tracking app that can track what you get and what you pay for, and where it
