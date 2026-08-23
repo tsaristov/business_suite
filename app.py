@@ -30,11 +30,20 @@ cal = _load_module("calendar_mod", "calendar", "calendar.py")
 checklist = _load_module("checklist_mod", "checklist", "checklist.py")
 habits = _load_module("habits_mod", "habits", "habits.py")
 
+# The assistant lives at assistant/engine.py (outside tools/); load it by full path.
+_asst_spec = importlib.util.spec_from_file_location(
+    "assistant_engine", os.path.join(BASE, "assistant", "engine.py"))
+assistant = importlib.util.module_from_spec(_asst_spec)
+_asst_spec.loader.exec_module(assistant)
+
 app = Flask(__name__)
 
 # Let templates/index.html include each tool's own UI at <tool>/interface.html
 # (e.g. {% include 'budget/interface.html' %}), resolved from the tools/ dir.
-app.jinja_loader = ChoiceLoader([app.jinja_loader, FileSystemLoader(TOOLS_DIR)])
+# BASE is added too so the assistant fragment at assistant/interface.html resolves.
+app.jinja_loader = ChoiceLoader([app.jinja_loader,
+                                 FileSystemLoader(TOOLS_DIR),
+                                 FileSystemLoader(BASE)])
 
 
 def _budget_context():
@@ -76,7 +85,7 @@ def _habits_context(days=49):
 
 @app.route("/")
 def index():
-    tab = request.args.get("tab", "budget")
+    tab = request.args.get("tab", "assistant")
     return render_template(
         "index.html",
         tab=tab,
@@ -356,6 +365,23 @@ def habits_complete(idx):
     if 0 <= idx < len(data) and habits.mark_complete(data[idx]):
         habits.save(data)
     return redirect(url_for("index", tab="habits"))
+
+
+# --- Assistant --- (natural-language layer over all four tools; see assistant/engine.py)
+@app.route("/api/assistant/chat", methods=["POST"])
+def assistant_chat():
+    payload = request.get_json(silent=True) or {}
+    return jsonify(assistant.chat(payload.get("message", "")))
+
+
+@app.route("/api/assistant/history", methods=["GET"])
+def assistant_history():
+    return jsonify(assistant.history(request.args.get("limit", 30)))
+
+
+@app.route("/api/assistant/clear-history", methods=["POST"])
+def assistant_clear_history():
+    return jsonify(assistant.clear_history())
 
 
 if __name__ == "__main__":

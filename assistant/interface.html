@@ -1,0 +1,204 @@
+{# Assistant tool UI fragment. Rendered inside the Flask app's Assistant tab
+   (see templates/index.html). A chat panel that talks to the Ollama-backed engine
+   via /api/assistant/*, with browser speech-to-text (mic) and text-to-speech.
+   Self-contained: Bootstrap 5.3 is already loaded by index.html. #}
+
+<style>
+  #asst-log { height: 460px; overflow-y: auto; background: #f8f9fa;
+              border: 1px solid #dee2e6; border-radius: .5rem; padding: 1rem; }
+  .asst-row { display: flex; margin-bottom: .5rem; }
+  .asst-row.user { justify-content: flex-end; }
+  .asst-bubble { max-width: 80%; padding: .5rem .75rem; border-radius: .75rem;
+                 white-space: pre-wrap; word-wrap: break-word; }
+  .asst-row.user .asst-bubble { background: #0d6efd; color: #fff;
+                                border-bottom-right-radius: .15rem; }
+  .asst-row.assistant .asst-bubble { background: #fff; border: 1px solid #dee2e6;
+                                     border-bottom-left-radius: .15rem; }
+  .asst-replay { cursor: pointer; font-size: .8rem; opacity: .55; margin-left: .35rem; }
+  .asst-replay:hover { opacity: 1; }
+  #asst-mic.listening { background: #e53935; color: #fff; border-color: #e53935; }
+  .asst-typing .asst-bubble { color: #6c757d; font-style: italic; }
+</style>
+
+<div class="d-flex justify-content-between align-items-center mb-2">
+  <div class="text-muted small">Local assistant — budget · calendar · checklist · habits</div>
+  <div>
+    <button id="asst-mute" class="btn btn-sm btn-outline-secondary" type="button"
+            title="Mute / unmute spoken replies">🔊</button>
+    <button id="asst-clear" class="btn btn-sm btn-outline-danger" type="button">Clear</button>
+  </div>
+</div>
+
+<div id="asst-log" aria-live="polite"></div>
+
+<div class="input-group mt-3">
+  <button id="asst-mic" class="btn btn-outline-secondary" type="button"
+          title="Speak">🎤</button>
+  <input id="asst-input" class="form-control" placeholder="Ask or tell me something…"
+         autocomplete="off">
+  <button id="asst-send" class="btn btn-primary" type="button">Send</button>
+</div>
+<div id="asst-hint" class="form-text"></div>
+
+<script>
+(function () {
+  const CHAT = "{{ url_for('assistant_chat') }}";
+  const HISTORY = "{{ url_for('assistant_history') }}";
+  const CLEAR = "{{ url_for('assistant_clear_history') }}";
+  const $ = (id) => document.getElementById(id);
+
+  const log = $("asst-log");
+  const input = $("asst-input");
+  let muted = false;
+  let loaded = false;
+
+  // --- rendering -----------------------------------------------------------
+  function scroll() { log.scrollTop = log.scrollHeight; }
+
+  function addBubble(role, text) {
+    const row = document.createElement("div");
+    row.className = "asst-row " + role;
+    const bubble = document.createElement("div");
+    bubble.className = "asst-bubble";
+    bubble.textContent = text;
+    if (role === "assistant") {
+      const replay = document.createElement("span");
+      replay.className = "asst-replay";
+      replay.textContent = "🔁";
+      replay.title = "Replay";
+      replay.addEventListener("click", () => speak(text));
+      bubble.appendChild(replay);
+    }
+    row.appendChild(bubble);
+    log.appendChild(row);
+    scroll();
+    return row;
+  }
+
+  function showTyping() {
+    const row = addBubble("assistant", "…thinking");
+    row.classList.add("asst-typing");
+    return row;
+  }
+
+  // --- text to speech ------------------------------------------------------
+  function speak(text) {
+    if (muted || !("speechSynthesis" in window)) return;
+    window.speechSynthesis.cancel();
+    // Strip markdown-ish characters for cleaner audio.
+    const clean = String(text).replace(/[*_`#>]/g, "");
+    const u = new SpeechSynthesisUtterance(clean);
+    const voice = window.speechSynthesis.getVoices()
+      .find((v) => /natural|google|samantha|zira/i.test(v.name));
+    if (voice) u.voice = voice;
+    window.speechSynthesis.speak(u);
+  }
+
+  // --- send a turn ---------------------------------------------------------
+  async function send(text) {
+    text = (text != null ? text : input.value).trim();
+    if (!text) return;
+    input.value = "";
+    addBubble("user", text);
+    const typing = showTyping();
+    try {
+      const res = await fetch(CHAT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: text }),
+      });
+      const data = await res.json();
+      typing.remove();
+      const reply = data.reply || "(no reply)";
+      addBubble("assistant", reply);
+      speak(reply);
+    } catch (e) {
+      typing.remove();
+      const msg = "Sorry — I couldn't reach the assistant.";
+      addBubble("assistant", msg);
+      speak(msg);
+    }
+  }
+
+  // --- history -------------------------------------------------------------
+  async function loadHistory() {
+    if (loaded) return;
+    loaded = true;
+    try {
+      const res = await fetch(HISTORY);
+      const data = await res.json();
+      log.innerHTML = "";
+      (data.history || []).forEach((h) =>
+        addBubble(h.role === "user" ? "user" : "assistant", h.message));
+      if (!(data.history || []).length) {
+        addBubble("assistant",
+          "Hi! I can manage your budget, calendar, checklist, and habits. "
+          + "Ask me anything.");
+      }
+    } catch (e) { /* leave empty on error */ }
+  }
+
+  async function clearHistory() {
+    await fetch(CLEAR, { method: "POST" });
+    log.innerHTML = "";
+    loaded = false;
+    loadHistory();
+  }
+
+  // --- speech to text ------------------------------------------------------
+  function setupMic() {
+    const mic = $("asst-mic");
+    const hint = $("asst-hint");
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      mic.style.display = "none";
+      hint.textContent = "Voice input isn't supported in this browser — type instead.";
+      return;
+    }
+    const recog = new SR();
+    recog.lang = "en-US";
+    recog.interimResults = false;
+    recog.maxAlternatives = 1;
+    let listening = false;
+
+    mic.addEventListener("click", () => {
+      if (listening) { recog.stop(); return; }
+      try { recog.start(); } catch (e) { /* already starting */ }
+    });
+    recog.addEventListener("start", () => {
+      listening = true; mic.classList.add("listening"); hint.textContent = "Listening…";
+    });
+    recog.addEventListener("end", () => {
+      listening = false; mic.classList.remove("listening"); hint.textContent = "";
+    });
+    recog.addEventListener("error", (e) => {
+      listening = false; mic.classList.remove("listening");
+      hint.textContent = e.error === "not-allowed"
+        ? "Microphone permission denied."
+        : "Didn't catch that — try again or type.";
+    });
+    recog.addEventListener("result", (e) => {
+      const text = e.results[0][0].transcript;
+      input.value = text;
+      send(text);
+    });
+  }
+
+  // --- wire up -------------------------------------------------------------
+  $("asst-send").addEventListener("click", () => send());
+  input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+  $("asst-mute").addEventListener("click", () => {
+    muted = !muted;
+    $("asst-mute").textContent = muted ? "🔇" : "🔊";
+    if (muted && "speechSynthesis" in window) window.speechSynthesis.cancel();
+  });
+  $("asst-clear").addEventListener("click", clearHistory);
+  setupMic();
+
+  // Populate voices (some browsers load them async) + load history now and on show.
+  if ("speechSynthesis" in window) window.speechSynthesis.getVoices();
+  loadHistory();
+  document.querySelectorAll('[data-bs-target="#assistant"]').forEach((btn) =>
+    btn.addEventListener("shown.bs.tab", loadHistory));
+})();
+</script>
