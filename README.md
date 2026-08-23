@@ -41,8 +41,6 @@ the assistant, an `interface.html` UI fragment for the web app, and its own
 ## Project Tools
 All of the projects can sync together using the assistant.
 
-An overview of the tools inside the suite, and their use/purpose.
-
 ### Assistant
 An LLM powered AI assistant with RAG context, tool usage, and agentic capabilities. It
 sits on top of every other tool, reading their data for context and calling their
