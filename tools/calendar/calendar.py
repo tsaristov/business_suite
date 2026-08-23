@@ -26,6 +26,7 @@ def add(events):
     description = input("Details/description: ").strip()
     priority = input("Priority (low/med/high): ").strip()
     event_date = input("Date (YYYY-MM-DD): ").strip()
+    event_time = input("Time (HH:MM, blank = all-day): ").strip()
     duration = input("Duration (e.g. 2h): ").strip()
     events.append(
         {
@@ -33,6 +34,7 @@ def add(events):
             "description": description,
             "priority": priority,
             "date": event_date,
+            "time": event_time,
             "duration": duration,
         }
     )
@@ -45,8 +47,9 @@ def view(events):
         print("No events yet.")
         return
     for i, e in enumerate(sorted(events, key=lambda x: x["date"])):
+        when = e["date"] + (f" {e['time']}" if e.get("time") else "")
         print(
-            f"{i}) {e['date']}  {e['title']}  [{e['priority']}]  {e['duration']}\n"
+            f"{i}) {when}  {e['title']}  [{e['priority']}]  {e['duration']}\n"
             f"    {e['description']}"
         )
 

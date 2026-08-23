@@ -1,35 +1,196 @@
 {# Calendar tool UI fragment. Rendered inside the Flask app's Calendar tab
-   (see templates/index.html). Context: `events` = list of event dicts. #}
-<form class="row g-2 align-items-end my-3" method="post" action="{{ url_for('calendar_add') }}">
-  <div class="col-md-3"><label class="form-label">Title</label>
-    <input name="title" class="form-control" required></div>
-  <div class="col-md-3"><label class="form-label">Description</label>
-    <input name="description" class="form-control"></div>
-  <div class="col-auto"><label class="form-label">Priority</label>
-    <select name="priority" class="form-select">
-      <option>low</option><option>med</option><option>high</option>
-    </select></div>
-  <div class="col-auto"><label class="form-label">Date</label>
-    <input name="date" type="date" class="form-control"></div>
-  <div class="col-auto"><label class="form-label">Duration</label>
-    <input name="duration" class="form-control" placeholder="2h"></div>
-  <div class="col-auto"><button class="btn btn-primary">Add</button></div>
-</form>
-<table class="table table-sm table-striped">
-  <thead><tr><th>Date</th><th>Title</th><th>Priority</th><th>Duration</th><th>Description</th><th></th></tr></thead>
-  <tbody>
-  {% for e in events %}
-    <tr>
-      <td>{{ e.date }}</td><td>{{ e.title }}</td><td>{{ e.priority }}</td>
-      <td>{{ e.duration }}</td><td>{{ e.description }}</td>
-      <td class="text-end">
-        <form method="post" action="{{ url_for('calendar_delete', idx=loop.index0) }}">
-          <button class="btn btn-sm btn-outline-danger">Delete</button>
-        </form>
-      </td>
-    </tr>
-  {% else %}
-    <tr><td colspan="6" class="text-muted">No events yet.</td></tr>
-  {% endfor %}
-  </tbody>
-</table>
+   (see templates/index.html). Interactive FullCalendar v6 with Day/Week/Month/Year
+   views. Reads/writes via the JSON API in app.py (/calendar/events). #}
+
+<!-- FullCalendar v6 standard bundle: core + interaction + dayGrid + timeGrid +
+     multimonth. CSS is auto-injected by the bundle; no separate stylesheet needed. -->
+<script src="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.15/index.global.min.js"></script>
+
+<style>
+  #calendar { max-width: 100%; }
+  /* Priority legend chips */
+  .cal-legend { font-size: .85rem; }
+  .cal-legend .dot { display:inline-block; width:.75rem; height:.75rem; border-radius:2px;
+                     margin-right:.25rem; vertical-align:middle; }
+  .fc .fc-button-primary { text-transform: capitalize; }
+</style>
+
+<div class="d-flex justify-content-end cal-legend text-muted mb-2 gap-3">
+  <span><span class="dot" style="background:#4caf50"></span>low</span>
+  <span><span class="dot" style="background:#2196f3"></span>med</span>
+  <span><span class="dot" style="background:#e53935"></span>high</span>
+</div>
+
+<div id="calendar"></div>
+
+<!-- Create / edit event modal -->
+<div class="modal fade" id="calEventModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title" id="calModalTitle">New event</h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="ev-id">
+        <div class="mb-2">
+          <label class="form-label">Title</label>
+          <input id="ev-title" class="form-control" required>
+        </div>
+        <div class="row g-2">
+          <div class="col-md-6 mb-2">
+            <label class="form-label">Date</label>
+            <input id="ev-date" type="date" class="form-control">
+          </div>
+          <div class="col-md-3 mb-2">
+            <label class="form-label">Time</label>
+            <input id="ev-time" type="time" class="form-control">
+            <div class="form-text">Blank = all-day</div>
+          </div>
+          <div class="col-md-3 mb-2">
+            <label class="form-label">Duration</label>
+            <input id="ev-duration" class="form-control" placeholder="1h">
+          </div>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Priority</label>
+          <select id="ev-priority" class="form-select">
+            <option value="low">low</option>
+            <option value="med" selected>med</option>
+            <option value="high">high</option>
+          </select>
+        </div>
+        <div class="mb-2">
+          <label class="form-label">Description</label>
+          <textarea id="ev-description" class="form-control" rows="2"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer justify-content-between">
+        <button type="button" class="btn btn-outline-danger" id="ev-delete">Delete</button>
+        <div>
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="ev-save">Save</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const API = "{{ url_for('calendar_events') }}";  // GET/POST; item = API + '/' + id
+  const $ = (id) => document.getElementById(id);
+  const pad = (n) => String(n).padStart(2, "0");
+  const dateVal = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const timeVal = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+
+  let calendar = null;
+  let modal = null;
+
+  function getModal() {
+    if (!modal) modal = bootstrap.Modal.getOrCreateInstance($("calEventModal"));
+    return modal;
+  }
+
+  // Populate + open the modal. `ev` = FullCalendar event for edit, or null for create.
+  function openModal({ id = "", date = "", time = "", duration = "", priority = "med",
+                       title = "", description = "" }) {
+    $("ev-id").value = id;
+    $("ev-title").value = title;
+    $("ev-date").value = date;
+    $("ev-time").value = time;
+    $("ev-duration").value = duration;
+    $("ev-priority").value = priority;
+    $("ev-description").value = description;
+    $("calModalTitle").textContent = id ? "Edit event" : "New event";
+    $("ev-delete").style.display = id ? "" : "none";
+    getModal().show();
+  }
+
+  async function saveEvent() {
+    const id = $("ev-id").value;
+    const body = {
+      title: $("ev-title").value.trim(),
+      date: $("ev-date").value,
+      time: $("ev-time").value,
+      duration: $("ev-duration").value.trim(),
+      priority: $("ev-priority").value,
+      description: $("ev-description").value.trim(),
+    };
+    if (!body.title) { $("ev-title").focus(); return; }
+    const url = id ? `${API}/${id}` : API;
+    const method = id ? "PUT" : "POST";
+    const res = await fetch(url, {
+      method,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) { alert("Save failed."); return; }
+    getModal().hide();
+    calendar.refetchEvents();
+  }
+
+  async function deleteEvent() {
+    const id = $("ev-id").value;
+    if (!id) return;
+    const res = await fetch(`${API}/${id}`, { method: "DELETE" });
+    if (!res.ok) { alert("Delete failed."); return; }
+    getModal().hide();
+    calendar.refetchEvents();
+  }
+
+  function init() {
+    calendar = new FullCalendar.Calendar($("calendar"), {
+      initialView: "dayGridMonth",
+      height: 720,
+      nowIndicator: true,
+      navLinks: true,          // click a day number (month/year) -> jump to day view
+      scrollTime: "08:00:00",
+      headerToolbar: {
+        left: "prev,next today",
+        center: "title",
+        right: "timeGridDay,timeGridWeek,dayGridMonth,multiMonthYear",
+      },
+      buttonText: { today: "Today", day: "Day", week: "Week", month: "Month", year: "Year" },
+      events: API,
+
+      // Click an empty slot/day -> create
+      dateClick: function (info) {
+        openModal({
+          date: dateVal(info.date),
+          time: info.allDay ? "" : timeVal(info.date),
+        });
+      },
+
+      // Click an event -> edit / delete
+      eventClick: function (info) {
+        const p = info.event.extendedProps || {};
+        openModal({
+          id: info.event.id,
+          title: info.event.title,
+          date: p.date || "",
+          time: p.time || "",
+          duration: p.duration || "",
+          priority: p.priority || "med",
+          description: p.description || "",
+        });
+      },
+    });
+    calendar.render();
+
+    $("ev-save").addEventListener("click", saveEvent);
+    $("ev-delete").addEventListener("click", deleteEvent);
+
+    // The Calendar tab starts hidden inside a Bootstrap tab-pane; fix sizing when shown.
+    document.querySelectorAll('[data-bs-target="#calendar"]').forEach((btn) =>
+      btn.addEventListener("shown.bs.tab", () => calendar.updateSize())
+    );
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+</script>

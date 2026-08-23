@@ -54,11 +54,24 @@ def mark_done(items):
         print("Invalid number.")
 
 
+def delete(items):
+    view(items)
+    if not items:
+        return
+    raw = input("Delete which #: ").strip()
+    try:
+        removed = items.pop(int(raw))
+        save(items)
+        print(f"Deleted: {removed['item']}")
+    except (ValueError, IndexError):
+        print("Invalid number.")
+
+
 def main():
     items = load()
     while True:
         print("\n--- CHECKLIST ---")
-        print("1) Add item\n2) View list\n3) Mark done\n0) Quit")
+        print("1) Add item\n2) View list\n3) Mark done\n4) Delete item\n0) Quit")
         choice = input("> ").strip()
         if choice == "1":
             add(items)
@@ -66,6 +79,8 @@ def main():
             view(items)
         elif choice == "3":
             mark_done(items)
+        elif choice == "4":
+            delete(items)
         elif choice == "0":
             break
         else:

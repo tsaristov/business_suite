@@ -2,9 +2,48 @@
 
 import json
 import os
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 DATA = os.path.join(os.path.dirname(__file__), "data.json")
+
+
+def completion_dates(habit):
+    """Set of YYYY-MM-DD strings the habit was completed on (dedupes same-day)."""
+    return {str(c)[:10] for c in habit.get("completions", [])}
+
+
+def completed_today(habit, today=None):
+    """True if the habit already has a completion dated today."""
+    today = (today or date.today()).isoformat()
+    return today in completion_dates(habit)
+
+
+def mark_complete(habit, now=None):
+    """Record one completion for today. No-op if already done today.
+
+    This is the single source of truth for the once-daily rule: spam clicks
+    (UI) or repeated CLI entries all funnel here and get rejected.
+    Returns True if a new completion was recorded, else False.
+    """
+    if completed_today(habit):
+        return False
+    stamp = (now or datetime.now()).isoformat(timespec="seconds")
+    habit.setdefault("completions", []).append(stamp)
+    return True
+
+
+def streak(habit, today=None):
+    """Consecutive-day streak ending today (or yesterday if not yet done today)."""
+    days = completion_dates(habit)
+    if not days:
+        return 0
+    today = today or date.today()
+    start = today if today.isoformat() in days else today - timedelta(days=1)
+    count, cur = 0, start
+    while cur.isoformat() in days:
+        count += 1
+        cur -= timedelta(days=1)
+    return count
 
 
 def load():
@@ -44,12 +83,15 @@ def complete(habits):
         return
     raw = input("Complete which #: ").strip()
     try:
-        stamp = datetime.now().isoformat(timespec="seconds")
-        habits[int(raw)]["completions"].append(stamp)
-        save(habits)
-        print(f"Marked complete at {stamp}.")
+        habit = habits[int(raw)]
     except (ValueError, IndexError):
         print("Invalid number.")
+        return
+    if mark_complete(habit):
+        save(habits)
+        print(f"Marked complete ({date.today().isoformat()}).")
+    else:
+        print("Already done today.")
 
 
 def main():

@@ -19,11 +19,16 @@
         <span class="badge bg-secondary">{{ it.priority }}</span>
         <span class="text-muted">{{ it.description }}</span>
       </span>
-      <form method="post" action="{{ url_for('checklist_done', idx=loop.index0) }}">
-        <button class="btn btn-sm {{ 'btn-outline-secondary' if it.done else 'btn-outline-success' }}">
-          {{ 'Undo' if it.done else 'Done' }}
-        </button>
-      </form>
+      <div class="d-flex gap-2">
+        <form method="post" action="{{ url_for('checklist_done', idx=loop.index0) }}">
+          <button class="btn btn-sm {{ 'btn-outline-secondary' if it.done else 'btn-outline-success' }}">
+            {{ 'Undo' if it.done else 'Done' }}
+          </button>
+        </form>
+        <form method="post" action="{{ url_for('checklist_delete', idx=loop.index0) }}">
+          <button class="btn btn-sm btn-outline-danger">Delete</button>
+        </form>
+      </div>
     </li>
   {% else %}
     <li class="list-group-item text-muted">List empty.</li>

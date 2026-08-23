@@ -47,8 +47,9 @@ def list_events(date=None):
     return {"ok": True, "events": events}
 
 
-def add_event(title, date, description="", priority="med", duration=""):
-    """Write: create an event. `date` is YYYY-MM-DD; `duration` is free text (e.g. 2h)."""
+def add_event(title, date, description="", priority="med", duration="", time=""):
+    """Write: create an event. `date` is YYYY-MM-DD; `time` is HH:MM (blank = all-day);
+    `duration` is free text (e.g. 2h)."""
     if not str(title).strip():
         return {"ok": False, "error": "title is required"}
     if priority not in _PRIORITIES:
@@ -56,7 +57,7 @@ def add_event(title, date, description="", priority="med", duration=""):
     events = _store.load()
     event = {"title": str(title).strip(), "description": str(description).strip(),
              "priority": priority, "date": str(date).strip(),
-             "duration": str(duration).strip()}
+             "time": str(time).strip(), "duration": str(duration).strip()}
     events.append(event)
     _store.save(events)
     return {"ok": True, "event": event, "count": len(events)}
@@ -69,7 +70,7 @@ def update_event(index, **fields):
         event = events[int(index)]
     except (IndexError, ValueError, TypeError):
         return {"ok": False, "error": f"no event at index {index}"}
-    allowed = {"title", "description", "priority", "date", "duration"}
+    allowed = {"title", "description", "priority", "date", "time", "duration"}
     bad = set(fields) - allowed
     if bad:
         return {"ok": False, "error": f"unknown fields: {sorted(bad)}"}
@@ -133,6 +134,7 @@ TOOLS = [
             "properties": {
                 "title": {"type": "string"},
                 "date": {"type": "string", "description": "YYYY-MM-DD"},
+                "time": {"type": "string", "description": "HH:MM, blank = all-day"},
                 "description": {"type": "string"},
                 "priority": {"type": "string", "enum": list(_PRIORITIES)},
                 "duration": {"type": "string", "description": "Free text, e.g. 2h"},
@@ -151,6 +153,7 @@ TOOLS = [
                 "index": {"type": "integer", "minimum": 0},
                 "title": {"type": "string"},
                 "date": {"type": "string"},
+                "time": {"type": "string", "description": "HH:MM, blank = all-day"},
                 "description": {"type": "string"},
                 "priority": {"type": "string", "enum": list(_PRIORITIES)},
                 "duration": {"type": "string"},

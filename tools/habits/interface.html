@@ -1,5 +1,11 @@
 {# Habits tool UI fragment. Rendered inside the Flask app's Habits tab
-   (see templates/index.html). Context: `habits` = list of habit dicts. #}
+   (see templates/index.html). Context: `habits` = list of enriched dicts from
+   app._habits_context() -> {name, total, done_today, streak, last, grid}. #}
+<style>
+  .habit-heatmap { display: grid; grid-template-columns: repeat(7, 15px); gap: 3px; }
+  .habit-cell { width: 15px; height: 15px; border-radius: 3px; background: #e9ecef; }
+  .habit-cell.done { background: #198754; }
+</style>
 <form class="row g-2 align-items-end my-3" method="post" action="{{ url_for('habits_add') }}">
   <div class="col-md-4"><label class="form-label">Habit name</label>
     <input name="name" class="form-control" required></div>
@@ -7,15 +13,28 @@
 </form>
 <ul class="list-group">
   {% for h in habits %}
-    <li class="list-group-item d-flex justify-content-between align-items-center">
-      <span>
-        <strong>{{ h.name }}</strong>
-        <span class="badge bg-info text-dark">{{ h.completions|length }} done</span>
-        <span class="text-muted">last: {{ h.completions[-1] if h.completions else 'never' }}</span>
-      </span>
-      <form method="post" action="{{ url_for('habits_complete', idx=loop.index0) }}">
-        <button class="btn btn-sm btn-outline-success">Mark complete</button>
-      </form>
+    <li class="list-group-item">
+      <div class="d-flex justify-content-between align-items-center">
+        <span>
+          <strong>{{ h.name }}</strong>
+          <span class="badge bg-info text-dark">{{ h.total }} done</span>
+          {% if h.streak %}<span class="badge bg-warning text-dark">🔥 {{ h.streak }}-day streak</span>{% endif %}
+          <span class="text-muted small">last: {{ h.last or 'never' }}</span>
+        </span>
+        <form method="post" action="{{ url_for('habits_complete', idx=loop.index0) }}">
+          {% if h.done_today %}
+            <button class="btn btn-sm btn-success" disabled>&check; Done today</button>
+          {% else %}
+            <button class="btn btn-sm btn-outline-success">Mark complete</button>
+          {% endif %}
+        </form>
+      </div>
+      <div class="habit-heatmap mt-2" title="Last {{ h.grid|length }} days">
+        {% for cell in h.grid %}
+          <span class="habit-cell {{ 'done' if cell.done else '' }}"
+                title="{{ cell.date }}{{ ' ✓' if cell.done else '' }}"></span>
+        {% endfor %}
+      </div>
     </li>
   {% else %}
     <li class="list-group-item text-muted">No habits yet.</li>
