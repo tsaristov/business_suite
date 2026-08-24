@@ -17,36 +17,34 @@
 
 ## 1. Overview & Purpose
 
-The assistant is a **natural-language secretary for the business suite**. A user asks
-in plain language — "how much did I spend this month", "move my dentist to Friday",
-"what's left on my list", "I did my workout today" — and the assistant reads the
-relevant tool's data, chooses which capability to invoke, performs the action, and
-replies in a short, spoken-quality sentence.
+The assistant is a **generic function-calling runtime**. A user asks in plain language —
+"how much did I spend this month", "move my dentist to Friday", "what's left on my
+list", "I did my workout today" — and the LLM decides which tool functions to call; the
+engine executes them, feeds results back, and the LLM writes the reply.
 
-Core design choice: **"the model plans, deterministic tools act."**
-
-- A **local LLM planner** (Ollama) interprets the request and chooses which tool to
-  call. It sees a compact, grounded summary of suite state (RAG) plus the
-  machine-readable capability manifest each module publishes.
-- **Every data change flows through a module's `agent.py` `execute()`**, never through
-  text the model writes directly. The tool layer validates parameters and gates
-  destructive actions behind a confirmation.
+Core design choice: **the engine knows how to run tools, not what they mean.** All
+domain meaning lives in the tools or is decided by the LLM. The engine has **no**
+hardcoded module names, routing keywords, overview rules, grounding logic, or date
+handling — it discovers tools, presents them, executes calls, handles confirmations, and
+keeps sessions.
 
 **Design principles.**
 
-- **Provider-agnostic, local-first.** The engine depends only on an abstract
-  model-runtime call; the **shipped adapter is Ollama**, running the user's own model on
-  their machine. No hosted-vendor lock-in. Swapping models changes nothing but a name.
-- **Tool-driven mutations.** All writes run through a module's published `TOOLS` via
-  `execute()`; the model may only *propose* a call.
-- **Grounded answers (RAG).** Factual replies come from a live, capped snapshot of each
-  `data.json`, not from model memory.
-- **Confirmed destruction.** Destructive tools never run on a single turn; the assistant
-  surfaces the pending action and needs an explicit "yes".
-- **Graceful degradation.** If Ollama is unreachable, the turn returns a static help
-  reply and the app stays up; reads and the tools' own CLIs still work.
-- **Spoken-quality replies.** Every reply is one or two short, plain sentences suitable
-  for text-to-speech.
+- **Generic runtime.** The engine only: discovers functions, presents them to the LLM,
+  executes them, relays results, handles confirmations, and maintains sessions. It never
+  encodes what a calendar/checklist/habit/budget is, what "today" means, or which words
+  imply which tool.
+- **Tools own their meaning.** Each `agent.py` describes its own tools (`description` /
+  `when_to_use`), optionally exposes a read-only `context()`, marks writes with
+  `mutates`, and validates + previews its own destructive actions.
+- **LLM does the semantics.** One call shows the LLM every namespaced tool; it reasons
+  about which are relevant ("day overview → events + tasks + habits") and calls them.
+- **Provider-agnostic, local-first.** One adapter (`_model_chat`); shipped on a local
+  Ollama model (default `llama3.1:latest`). Swapping models changes only a name.
+- **Confirmed destruction.** Destructive tools never run on a single turn; the tool
+  returns a human preview, the engine gets an explicit yes/no.
+- **Graceful degradation.** If the model is unreachable, the turn returns a short help
+  reply and the app stays up; the tools' own CLIs still work.
 
 ---
 
@@ -56,9 +54,9 @@ Core design choice: **"the model plans, deterministic tools act."**
 | :--- | :--- |
 | **User** | Types or speaks natural-language requests; reads/hears replies. |
 | **Voice client** (`interface.html`) | Browser STT (mic → text) and TTS (reply → speech); renders the chat. |
-| **Assistant engine** (`engine.py`) | Orchestrates each turn: resolve confirmation → ground → route → act → reply. |
-| **Model runtime** (Ollama, pluggable) | The user's local LLM; interprets the turn and emits tool calls, grounded in supplied context. |
-| **Module agents** (`tools/<name>/agent.py`) | Publish capabilities (`describe()`) and execute them (`execute()`). Four: budget, calendar, checklist, habits. |
+| **Assistant engine** (`engine.py`) | Generic runtime: discover tools → present all → execute calls → relay results → handle confirmations → keep sessions. |
+| **Model runtime** (Ollama, pluggable) | The user's local LLM; decides which tools to call and writes the reply. |
+| **Module agents** (`tools/<name>/agent.py`) | Own their meaning: `describe()`, `execute()`, optional `context()`, `mutates` flags, destructive previews. Discovered dynamically. |
 | **Module stores** (`tools/<name>/data.json`) | Persistent state each agent reads/writes. |
 | **Assistant store** (`assistant/data.json`) | Conversation history + single-slot pending confirmation. |
 
@@ -70,22 +68,23 @@ the assistant treats them uniformly and discovers tools dynamically:
 | Member | Meaning |
 | :--- | :--- |
 | `describe()` | `{ module, usage_rules, tools }` — the full capability manifest. |
-| `TOOLS` | Tool specs: `name`, `description`, `when_to_use`, `parameters` (JSON-Schema), `requires_confirmation`. |
-| `execute(action, params, confirm=False)` | Runs one tool by name; returns a result dict; never raises for ordinary errors. |
+| `TOOLS` | Tool specs: `name`, `description`, `when_to_use`, `parameters` (JSON-Schema), `requires_confirmation`, `mutates` (writes only). |
+| `execute(action, params, confirm=False)` | Runs one tool; returns a result dict; for a destructive call with `confirm=False` it validates the target and returns either an error (missing) or `needs_confirmation` + a human `message`. |
+| `context()` *(optional)* | Read-only summary string the engine concatenates into the LLM prompt. The engine never parses it. |
 
-**Portability requirement.** The engine discovers tools by calling `describe()` on each
-registered module — never by hard-coding tool names. A fifth tool following the same
-contract becomes available with no engine change.
+**Discovery.** The engine scans `tools/*/agent.py`, imports each, and flattens all tools
+into one **namespaced** set (`module__action`). A new tool folder following this contract
+appears to the LLM with **zero engine changes**.
 
 ### 2.2 Component boundary
 
 ```mermaid
 flowchart TD
     U["User (type or speak)"] --> UI["Voice client (interface.html)\nSTT / TTS / chat"]
-    UI -->|"POST /api/assistant/chat"| ENGINE["Assistant engine (engine.py)"]
-    ENGINE -->|"stage 1 + stage 2 (grounding + tools)"| OLLAMA["Ollama model (local, qwen3:4b)"]
-    OLLAMA -->|"tool call(s)"| ENGINE
-    ENGINE -->|"execute(action, params, confirm)"| AG["budget / calendar / checklist / habits agent.py"]
+    UI -->|"POST /api/assistant/chat"| ENGINE["Assistant engine (generic runtime)"]
+    ENGINE -->|"all namespaced tools + tool context()"| OLLAMA["Ollama model (local, llama3.1:8b)"]
+    OLLAMA -->|"tool call(s): module__action"| ENGINE
+    ENGINE -->|"dispatch execute(action, params)"| AG["discovered tools/*/agent.py"]
     AG --> STORES[("tools/*/data.json")]
     ENGINE --> ASTORE[("assistant/data.json\nhistory + pending")]
 ```
@@ -94,144 +93,98 @@ flowchart TD
 
 ## 3. Processing Pipeline (Behavioral Contract)
 
-Each turn is processed as an ordered sequence (`engine.chat(message)`):
+Each turn is processed as an ordered sequence (`engine.chat_events(message, session_id)`):
 
-1. **Empty-input guard.** Empty/whitespace → return a short inviting prompt
-   (`action="empty"`); nothing else runs.
-2. **Record the user turn** to history before processing.
+1. **Empty-input guard.** Empty/whitespace → short prompt (`action="empty"`).
+2. **Record the user turn** to the session before processing.
 3. **Resolve pending confirmation (first).** If a live pending confirmation exists
    (Section 7) and the text is a yes/no word, resolve it deterministically and return —
    *before* any model call.
-4. **Assemble grounding.** Build a compact, capped state summary from the four stores
-   (Section 5).
-5. **Stage 1 — route or answer.** One model call offering the `select_modules` tool.
-   The model returns the relevant module(s). A deterministic **overview** detector forces
-   `calendar+checklist+habits` for broad "what's my day" queries. No modules + a text
-   answer → grounded reply (`action="answered"`); runtime unreachable → static help
-   (`action="fallback"`).
-6. **Stage 2 — act (per module).** For each selected module, a call offering only that
-   module's tools; run a bounded tool-use loop (≤4 hops), dispatching each tool call
-   through `execute()` and feeding results back. Results accumulate across modules.
-   - Any `needs_confirmation` result **pauses** the whole turn: store the pending action
-     and return a yes/no prompt (`action="needs_confirmation"`).
-7. **Synthesize & reply.** For a multi-module turn, one final call combines all tool
-   results into a single reply (`Composing summary`); single-module turns use that
-   module's reply directly. Record it and return the envelope (Section 8).
+4. **Gather context.** Concatenate each tool's optional `context()` into a read-only
+   block (Section 5). The engine does not parse or compute anything domain-specific.
+5. **Single function-calling loop.** Build `[system persona + context] + recent history`
+   and offer **all** namespaced tools in one call. Loop (≤6 hops):
+   - Model returns tool calls → dispatch each `module__action` to
+     `MODULES[module].execute(action, params)`, append the result, continue.
+   - A `needs_confirmation` result **pauses** the turn: store the pending action and
+     return the tool's preview + yes/no prompt (`action="needs_confirmation"`).
+   - Model returns no tool calls → that text is the final reply
+     (`action="tool_ok"` if any tool ran, else `answered`).
+   - Model unreachable → short help reply (`action="fallback"`).
+6. **Reply & refresh.** Record the reply; the envelope carries `modules`/`changed`
+   (modules with a successful `mutates` call) so the UI refreshes those tabs.
 
 ---
 
-## 4. Two-Stage Routing & Capability Aggregation
+## 4. Tool Discovery & Registry
 
-The engine defines **no tools of its own**. It reads capabilities from each module's
-`describe()` and routes in two stages so a small model never faces all ~29 tools at once.
+The engine defines **no tools of its own** and hard-codes no module names.
 
-### 4.1 Stage 1 — module selection (one or many)
+- **Discovery:** scan `tools/*/agent.py`, import each, build `MODULES` dynamically
+  (`_discover_modules`). A broken tool is skipped, not fatal.
+- **Namespacing:** flatten every module's `describe()["tools"]` into one function-tool
+  list named `f"{module}__{action}"`, with a dispatch map `{fullname: (module, action)}`
+  and a `mutating` set (from each tool's `mutates` flag). `when_to_use` is folded into
+  the description so the LLM has the tool's own semantic hint.
+- **One call, all tools.** Every tool is offered to the LLM on every turn; the LLM
+  decides which are relevant and may call several across modules in one turn, and read
+  before it writes. There is no pre-filtering stage, no routing keywords, no overview
+  detector — that intelligence is the LLM's.
 
-The model is offered exactly one tool:
-
-```
-select_modules(modules: array<enum["budget","calendar","checklist","habits"]>)
-```
-
-Instruction: include **every** module the request touches — a day overview picks
-calendar + checklist + habits; a write picks the target module. An empty list ⇒ answer
-from grounding. Two deterministic safety-nets cover small-model misses: an **overview
-detector** (phrases like "what's my day", "agenda", "rundown") forces
-calendar+checklist+habits; a **keyword router** forces a single module when the model
-free-texts instead of routing, so writes are never silently dropped.
-
-### 4.2 Stage 2 — action selection & execution (per module)
-
-Each selected module's `describe()["tools"]` are converted to Ollama function tools
-(`when_to_use` folded into the description) and offered alone. The model emits tool
-call(s); each is dispatched via `module.execute(name, args)` and the result appended as a
-`tool` message. The loop repeats (≤4 hops) so the model can **read before it writes**
-(e.g. `list_events` to find an index, then `update_event`). When more than one module
-ran, a final **synthesis** call merges their results into one reply.
-
-### 4.3 Tool inventory (⚠️ = destructive, two-step confirm)
-
-| Module | Tools |
-| :--- | :--- |
-| **budget** | `get_summary`, `list_transactions`, `list_categories`, `limit_status`, `bill_status`, `goal_status`, `spending_breakdown`, `add_transaction`, `add_category`, `set_limit`, `add_bill`, `add_goal`, `contribute_goal`, ⚠️`delete_transaction`, ⚠️`remove_limit`, ⚠️`remove_bill`, ⚠️`remove_goal` |
-| **calendar** | `list_events`, `add_event`, `update_event`, ⚠️`delete_event` |
-| **checklist** | `list_items`, `add_item`, `set_done`, ⚠️`delete_item` |
-| **habits** | `list_habits`, `add_habit`, `mark_complete`, ⚠️`delete_habit` |
-
-### 4.4 Addressing conventions (from each module's `USAGE_RULES`)
-
-- **calendar** and **checklist** act by **index** (from `list_events` / `list_items`
-  order). **habits** act by **name** (case-insensitive). **budget** deletes by index;
-  limits by category.
-- Resolve relative dates ("tomorrow", "next Fri") to absolute `YYYY-MM-DD` before a
-  calendar write.
-- `priority` is `low`/`med`/`high`, default `med`.
+Adding `tools/<new>/agent.py` (with `describe`/`execute`, optional `context`, `mutates`)
+makes its tools available with **zero engine edits**.
 
 ---
 
-## 5. Grounding Context (RAG)
+## 5. Context (tool-provided, not engine-computed)
 
-Before routing, the engine reads the four stores and builds a **capped** summary
-(`_grounding()`), rebuilt every turn so it reflects earlier writes in the same session:
-
-- **budget:** balance; this month earned/spent/net; categories currently `over` limit;
-  bills due soon.
-- **calendar:** upcoming events (indexed) — date, time, title, priority.
-- **checklist:** open items (indexed) with priority.
-- **habits:** each habit with completion count and last-done.
-
-Rules: list lengths are capped (≤10 each); building the summary is **read-only**; the
-full stores are never inlined — for detail beyond the cap the model calls a `list_*`
-tool in stage 2.
+The engine calls each module's optional `context()` and concatenates the results under a
+"Current context (read-only)" heading. It never inspects the contents. Tools decide what
+to surface and own any date logic (e.g. calendar's `context()` states today's date and
+lists upcoming events with the index to act on; habits reports today's done status).
+This replaces the old engine-side grounding — the engine no longer knows what any store
+contains.
 
 ---
 
 ## 6. Model Runtime — Ollama Adapter
 
-The runtime is isolated in one function (`_model_chat`) so the provider is swappable.
-
-**Shipped adapter.** `ollama.chat(model, messages, tools, options)` against the local
-Ollama daemon.
+Isolated in one function (`_model_chat`) so the provider is swappable.
 
 | Setting | Value |
 | :--- | :--- |
-| Model | `OLLAMA_MODEL` env var, default `llama3.2:3b`. Must be a **non-reasoning** tool-caller (llama3.2, qwen2.5, mistral). Reasoning models (qwen3.x) are unsuitable — they emit chain-of-thought as reply text and avoid calling destructive tools. |
-| Host | Default local daemon; `OLLAMA_HOST` honored by the Ollama client. |
-| Determinism | `temperature = 0.1` — favor consistent tool selection. |
-| Reasoning | `think=False` requested; a `<think>…</think>` stripper (`_clean`) also guards against models that ignore it. |
-| Tools | Function-tool schemas built from each module's `TOOLS`. |
-| Routing safety-net | If the model free-texts instead of routing, a deterministic keyword router (`_keyword_route`) forces the correct module so writes are never silently dropped. |
-| Streaming | Not used; a single complete message per call. |
-| Failure | Any exception (daemon down, timeout) → `_model_chat` returns `None`; the engine falls back to the static help reply. The tool layer, never the model, performs writes. |
-
-**Requirement.** The model may only propose tool calls; it never writes to a store
-directly.
+| Model | `OLLAMA_MODEL`, default `llama3.1:latest` (8B). All ~29 tools are shown in one call, so a **capable, non-reasoning** tool-caller is required (llama3.1/qwen2.5/mistral). Avoid reasoning models (qwen3.x): they leak chain-of-thought and dodge destructive tools. |
+| Determinism | `temperature = 0.1`. |
+| Reasoning | `think=False` + a `<think>…</think>` stripper (`_clean`). |
+| Loop bound | ≤6 tool-use hops per turn; if exceeded, one final tool-free call summarizes. |
+| Streaming | Not used at the model layer; the HTTP layer streams stage/final events. |
+| Failure | Any exception → `_model_chat` returns `None` → short help reply. Tools, never the model, perform writes. |
 
 ---
 
-## 7. Confirmation Flow (Destructive Actions)
+## 7. Confirmation Flow (tool-owned validation)
 
-Destructive tools (`requires_confirmation`, the ⚠️ rows) use a **two-step** flow the
-tool layer enforces. Calling `execute()` without `confirm=True` returns:
+Destructive tools carry `requires_confirmation`. The **tool** owns validation + the
+human preview; the engine is generic. Calling `execute()` with `confirm=False`:
 
 ```
-{ "ok": false, "needs_confirmation": true,
-  "message": "'<action>' is destructive. Re-run with confirm=True.",
-  "params": { ... } }
+target missing  -> { "ok": false, "error": "no <thing> …" }         (no confirmation)
+target exists   -> { "ok": false, "needs_confirmation": true,
+                     "message": "Delete <human label>? This can't be undone.", "params": {…} }
 ```
 
 **Engine behavior.**
 
-- On `needs_confirmation`, store a single-slot pending `{module, action, params, ts}` in
-  `assistant/data.json` and return a yes/no prompt naming the target
-  (`action="needs_confirmation"`).
-- **Next turn, before routing:** an **affirmative** word re-runs
+- On `needs_confirmation`, store a single-slot pending `{module, action, params, ts}` and
+  return the tool's `message` + a yes/no prompt (`action="needs_confirmation"`). The
+  engine never builds the label — the tool does.
+- **Next turn (before the model):** an **affirmative** word re-runs
   `execute(..., confirm=True)` (`action="confirmed"`); a **negative** word discards it
-  (`action="canceled"`). Resolution is **deterministic** — matched against fixed
-  affirmative/negative word lists, never judged by the model.
-- **Expiry:** a pending older than **5 minutes** is ignored; a stale yes/no becomes
-  ordinary input.
-- **Single-slot:** only one pending exists at a time; a new one replaces it.
+  (`action="canceled"`). Resolution uses fixed yes/no word-lists — the only hardcoded
+  words in the engine, and only for confirmation, never routing.
+- **Expiry:** a pending older than **5 minutes** is ignored. **Single-slot:** a new one
+  replaces any prior.
+- Because the tool validates first, the engine never confirms a delete that would fail.
 
 ---
 
@@ -270,11 +223,10 @@ Served by `app.py`; consumed by `interface.html`.
 `chat` and `chat/stream` also accept an optional `session_id` in the body; omitted ⇒ the
 active session.
 
-**Progress stages** (order reflects the real pipeline): `Reading your data` →
-`Detecting tool usage` → per module `Checking <module>` → (`Deciding next step` ↔
-`Using <module>: <action>`)* → `Generating reply`; multi-module turns end with
-`Composing summary`; confirmation turns emit `Confirming action`. The chat UI renders
-these as a live timeline instead of a static "thinking".
+**Progress stages** (generic, no domain words): `Reading context` → (`Thinking` ↔
+`Calling <module>__<action>`)* → final; a hop-limit turn ends with `Composing reply`;
+confirmation turns emit `Confirming action`. The chat UI renders these as a live
+timeline instead of a static "thinking".
 
 The chat UI fragment is served like every tool: `templates/index.html` includes
 `assistant/interface.html`, resolved by the Jinja `ChoiceLoader` (which now also sees
@@ -339,7 +291,7 @@ Each is a short chain of existing tools — no new tool logic.
 
 | User intent | Plan |
 | :--- | :--- |
-| "How's my month going?" | Answered from grounding in stage 1 (no tool call). |
+| "How's my month going?" | LLM calls `budget__get_summary` (+ others it deems relevant). |
 | "Am I free Friday and can I afford a $200 venue?" | `calendar.list_events(Fri)` + budget summary in grounding → answer; on yes, `add_event` (+ optional `add_transaction`). |
 | "Book my dentist Friday 3pm and add a prep task" | `calendar.add_event` → (re-route) `checklist.add_item`. |
 | "I finished the tax paperwork" | `checklist.list_items(open)` → `set_done`. |

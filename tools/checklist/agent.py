@@ -40,10 +40,11 @@ _store = _sibling("checklist.py")  # reuse its load()/save() and data.json locat
 # Handlers — the actual read/use/write operations
 # --------------------------------------------------------------------------- #
 def list_items(status="all"):
-    """Read: checklist items. status = all | open | done."""
+    """Read: checklist items, each with its stable `index` (raw store position, used by
+    set_done/delete). status = all | open | done."""
     if status not in ("all", "open", "done"):
         return {"ok": False, "error": "status must be all, open, or done"}
-    items = _store.load()
+    items = [{**it, "index": i} for i, it in enumerate(_store.load())]
     if status == "open":
         items = [it for it in items if not it["done"]]
     elif status == "done":
@@ -88,6 +89,35 @@ def delete_item(index):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only context + destructive-action preview (the tool owns its own meaning)
+# --------------------------------------------------------------------------- #
+def context():
+    """Read-only summary for the assistant: open tasks with the index to act on."""
+    items = [{**it, "index": i} for i, it in enumerate(_store.load())]
+    open_items = [it for it in items if not it["done"]]
+    if not open_items:
+        return "No open tasks."
+    lines = ["Open tasks (index · priority · item):"]
+    for it in open_items:
+        lines.append(f"  [{it['index']}] [{it.get('priority', '')}] {it.get('item', '')}")
+    return "\n".join(lines)
+
+
+def _preview(action, params):
+    """(exists, label) for a destructive action; label doubles as the not-found error."""
+    if action == "delete_item":
+        items = _store.load()
+        try:
+            i = int(params.get("index", -1))
+        except (TypeError, ValueError):
+            return False, "no task at that index"
+        if 0 <= i < len(items):
+            return True, f"'{items[i].get('item', '')}'"
+        return False, "no task at that index"
+    return True, action.replace("_", " ")
+
+
+# --------------------------------------------------------------------------- #
 # Capability manifest
 # --------------------------------------------------------------------------- #
 USAGE_RULES = """\
@@ -121,6 +151,7 @@ TOOLS = [
     },
     {
         "name": "add_item",
+        "mutates": True,
         "description": "Add a new checklist item.",
         "when_to_use": "User has a new task/to-do.",
         "parameters": {
@@ -136,6 +167,7 @@ TOOLS = [
     },
     {
         "name": "set_done",
+        "mutates": True,
         "description": "Mark an item done (or reopen with done=false).",
         "when_to_use": "User completes or reopens a task.",
         "parameters": {
@@ -150,6 +182,7 @@ TOOLS = [
     },
     {
         "name": "delete_item",
+        "mutates": True,
         "description": "Remove an item by index.",
         "when_to_use": "User explicitly wants a task deleted (not just completed).",
         "parameters": {
@@ -188,8 +221,11 @@ def execute(action, params=None, confirm=False):
         return {"ok": False, "error": f"unknown action '{action}'",
                 "available": list(_HANDLERS)}
     if spec["requires_confirmation"] and not confirm:
+        exists, label = _preview(action, params)
+        if not exists:
+            return {"ok": False, "error": label}
         return {"ok": False, "needs_confirmation": True,
-                "message": f"'{action}' is destructive. Re-run with confirm=True.",
+                "message": f"Delete {label}? This can't be undone.",
                 "params": params}
     try:
         return _HANDLERS[action](**params)

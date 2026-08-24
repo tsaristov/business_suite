@@ -1,21 +1,19 @@
-"""Assistant engine — the suite's natural-language secretary.
+"""Assistant engine — a generic function-calling runtime.
 
-Provider-agnostic planner that sits on top of the four tool modules (budget,
-calendar, checklist, habits) and drives them through their agent.py capability
-layers. The shipped model runtime is a LOCAL Ollama model; it is isolated behind
-one thin adapter (`_model_chat`) so any provider could replace it.
+The engine knows how to run tools, not what they mean. It:
+  - discovers tools dynamically (every tools/<name>/agent.py),
+  - presents them to the LLM as one flat, namespaced tool set (module__action),
+  - executes the calls the LLM makes and feeds results back,
+  - handles destructive-action confirmations,
+  - maintains conversation sessions.
 
-Design (see output.md):
-- "The model plans, deterministic tools act." The LLM only *chooses* tools; every
-  mutation runs through a module's agent.execute(), which validates params and gates
-  destructive actions behind a confirmation.
-- Two-stage routing keeps the tool count per model call small (accurate on 3-4B):
-    stage 1 -> pick the relevant module(s)  (can be several: "what's my day")
-    stage 2 -> pick each module's action (<=17 choices), then synthesize one reply
-- Grounding (RAG): a compact, capped snapshot of all four stores is read fresh each
-  turn so the model can answer factual questions without holding the whole database.
-- Confirmation is deterministic (a yes/no word list), never judged by the model.
-- History lives in named, persistent sessions (sidebar in the UI).
+All domain meaning lives in the tools: what each tool is for (its description /
+when_to_use), a read-only `context()` a tool may expose, and destructive-action
+validation + previews (the tool decides). There are NO hardcoded keywords, module
+names, routing rules, or date logic here. The LLM does the semantic understanding.
+
+The model runtime is a LOCAL Ollama model behind one adapter (`_model_chat`); any
+provider could replace it.
 
 Public API (used by app.py):
     chat(message, session_id=None)        -> {reply, action, results, modules, changed}
@@ -30,33 +28,41 @@ import importlib.util
 import json
 import os
 import re
-from datetime import datetime, date
+from datetime import datetime
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _BASE = os.path.dirname(_HERE)
 _TOOLS_DIR = os.path.join(_BASE, "tools")
 _DATA = os.path.join(_HERE, "data.json")
 
-# Default to a clean, non-reasoning tool-caller. Reasoning models (qwen3.x) dump
-# chain-of-thought into the reply and hesitate to call destructive tools, which breaks
-# both TTS output and the confirmation gate. Override with OLLAMA_MODEL if desired.
-MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+# A capable, non-reasoning tool-caller. All tools are shown in one call, so the model
+# must handle many functions + genuine intent understanding. Override with OLLAMA_MODEL.
+MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
 
-# Confirmation follow-ups are only honored for a short window.
+_MAX_HOPS = 6          # bound the tool-use loop per turn
 _PENDING_TTL_SECONDS = 5 * 60
 
+# The ONE hardcoded word set — for resolving a yes/no confirmation, not routing.
 _AFFIRM = {"yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm",
            "confirmed", "do it", "go ahead", "please do", "affirmative"}
 _DENY = {"no", "n", "nope", "nah", "cancel", "never mind", "nevermind", "stop",
          "don't", "dont", "negative"}
 
-_HELP = ("I can manage your budget, calendar, checklist, and habits. Try "
-         "\"what's my balance\", \"schedule a call Friday 3pm\", \"add buy milk "
-         "to my checklist\", or \"I did my workout today\".")
+_HELP = "I can't reach the assistant model right now — make sure Ollama is running."
+
+_PERSONA = (
+    "You are a helpful assistant with access to the user's tools. Decide which tools to "
+    "call to satisfy the request; you may call several, across different tools, in one "
+    "turn. To act on a specific existing item (update, complete, delete), FIRST call the "
+    "matching list/status tool and use the exact identifier (e.g. index) it returns — "
+    "never guess an index. If a tool was used, include ALL data from its output that is "
+    "relevant to the user's question — do not omit items. Answer concisely in plain "
+    "language suitable to be read aloud, and give only the final answer, not your reasoning."
+)
 
 
 # --------------------------------------------------------------------------- #
-# Module loading — reuse the suite's file-path import pattern
+# Tool discovery & registry (the engine's only knowledge of tools)
 # --------------------------------------------------------------------------- #
 def _load(name, *parts):
     path = os.path.join(_TOOLS_DIR, *parts)
@@ -66,19 +72,68 @@ def _load(name, *parts):
     return module
 
 
-# Each value is a module agent exposing describe()/execute() (see tools/*/agent.py).
-MODULES = {
-    "budget": _load("assistant_budget_agent", "budget", "agent.py"),
-    "calendar": _load("assistant_calendar_agent", "calendar", "agent.py"),
-    "checklist": _load("assistant_checklist_agent", "checklist", "agent.py"),
-    "habits": _load("assistant_habits_agent", "habits", "agent.py"),
-}
+def _discover_modules():
+    """Every tools/<name>/agent.py becomes an available module. No hardcoded list."""
+    mods = {}
+    if not os.path.isdir(_TOOLS_DIR):
+        return mods
+    for name in sorted(os.listdir(_TOOLS_DIR)):
+        agent = os.path.join(_TOOLS_DIR, name, "agent.py")
+        if os.path.isfile(agent):
+            try:
+                mods[name] = _load(f"assistant_{name}_agent", name, "agent.py")
+            except Exception:
+                pass  # a broken tool must not take down the whole assistant
+    return mods
+
+
+MODULES = _discover_modules()
+
+
+def _build_registry():
+    """Flatten every module's tools into one namespaced function-tool list.
+    Returns (ollama_specs, dispatch{fullname:(module,action)}, mutating{fullname})."""
+    specs, dispatch, mutating = [], {}, set()
+    for mod_name, mod in MODULES.items():
+        try:
+            tools = mod.describe().get("tools", [])
+        except Exception:
+            tools = []
+        for t in tools:
+            full = f"{mod_name}__{t['name']}"
+            dispatch[full] = (mod_name, t["name"])
+            if t.get("mutates"):
+                mutating.add(full)
+            desc = t.get("description", "")
+            if t.get("when_to_use"):
+                desc = f"{desc} Use when: {t['when_to_use']}"
+            specs.append({"type": "function",
+                          "function": {"name": full, "description": desc,
+                                       "parameters": t.get("parameters", {})}})
+    return specs, dispatch, mutating
+
+
+_TOOLSPECS, _DISPATCH, _MUTATING = _build_registry()
+
+
+def _context_block():
+    """Concatenate each tool's optional read-only context(). The engine does not parse
+    or understand the contents — tools decide what (if anything) to surface."""
+    parts = []
+    for name, mod in MODULES.items():
+        fn = getattr(mod, "context", None)
+        if callable(fn):
+            try:
+                text = fn()
+            except Exception:
+                text = None
+            if text:
+                parts.append(f"## {name}\n{text}")
+    return "\n\n".join(parts)
 
 
 # --------------------------------------------------------------------------- #
-# Store — multiple named chat sessions, each with its own history + pending slot.
-# Shape: {"sessions": [{id, title, created_at, updated_at, history, pending}],
-#         "active_id": <id>}
+# Store — multiple named chat sessions, each with history + a pending slot.
 # --------------------------------------------------------------------------- #
 def _now():
     return datetime.now().isoformat(timespec="seconds")
@@ -95,8 +150,6 @@ def _blank_session(title="New chat"):
 
 
 def _load_store():
-    # `dirty` = we synthesized/migrated something and must persist it, so ids stay
-    # stable across pure reads (list_sessions/history) that don't otherwise save.
     dirty = False
     if not os.path.exists(_DATA) or os.path.getsize(_DATA) == 0:
         s = _blank_session()
@@ -105,8 +158,7 @@ def _load_store():
         return data
     with open(_DATA) as f:
         data = json.load(f)
-    # Migrate the old single-conversation shape into one session.
-    if "sessions" not in data:
+    if "sessions" not in data:                      # migrate old single-conversation
         s = _blank_session()
         s["history"] = data.get("history", [])
         s["pending"] = data.get("pending")
@@ -114,8 +166,7 @@ def _load_store():
         dirty = True
     if not data.get("sessions"):
         s = _blank_session()
-        data["sessions"] = [s]
-        data["active_id"] = s["id"]
+        data["sessions"], data["active_id"] = [s], s["id"]
         dirty = True
     for sess in data["sessions"]:
         sess.setdefault("history", [])
@@ -134,7 +185,6 @@ def _save_store(data):
 
 
 def _get_session(store, session_id=None):
-    """Return the requested session, or the active one. Falls back to the first."""
     sid = session_id or store.get("active_id")
     for sess in store["sessions"]:
         if sess["id"] == sid:
@@ -143,29 +193,34 @@ def _get_session(store, session_id=None):
 
 
 def _record(session, role, message):
-    session["history"].append({
-        "role": role, "message": message, "created_at": _now(),
-    })
+    session["history"].append({"role": role, "message": message, "created_at": _now()})
     session["updated_at"] = _now()
-    # Auto-title a fresh session from its first user message.
     if role == "user" and session.get("title") in (None, "", "New chat"):
         session["title"] = (message[:40] + "…") if len(message) > 40 else message
+
+
+def _recent_history(session, limit=10):
+    """Recent turns as model messages (already includes the current user turn)."""
+    out = []
+    for h in session["history"][-limit:]:
+        role = "assistant" if h["role"] == "assistant" else "user"
+        out.append({"role": role, "content": h["message"]})
+    return out
 
 
 # --------------------------------------------------------------------------- #
 # Ollama adapter (the only provider-specific code)
 # --------------------------------------------------------------------------- #
 def _model_chat(messages, tools=None):
-    """Call the local model. Returns an ollama message object, or None if the
-    runtime is unreachable (caller then falls back to a static reply)."""
+    """Call the local model. Returns the message object, or None if unreachable."""
     try:
         import ollama
         resp = ollama.chat(
             model=MODEL,
             messages=messages,
             tools=tools or None,
-            think=False,  # disable chatty reasoning: faster + more direct tool calls
-            options={"temperature": 0.1},  # favor consistent tool selection
+            think=False,
+            options={"temperature": 0.1},
         )
         return resp.message
     except Exception:
@@ -173,251 +228,13 @@ def _model_chat(messages, tools=None):
 
 
 def _clean(content):
-    """Strip qwen3-style <think>...</think> reasoning some models emit inline, so
-    only the spoken answer reaches the user (and TTS)."""
+    """Strip any <think>...</think> reasoning a model might emit inline."""
     text = re.sub(r"(?is)<think>.*?</think>", "", content or "")
-    text = text.replace("<think>", "").replace("</think>", "")
-    return text.strip()
-
-
-def _as_function_tool(tool):
-    """Convert a module TOOLS entry into an Ollama function-tool schema. The
-    when_to_use hint is folded into the description so the model sees it."""
-    desc = tool["description"]
-    if tool.get("when_to_use"):
-        desc = f"{desc} Use when: {tool['when_to_use']}"
-    return {"type": "function",
-            "function": {"name": tool["name"], "description": desc,
-                         "parameters": tool["parameters"]}}
+    return text.replace("<think>", "").replace("</think>", "").strip()
 
 
 # --------------------------------------------------------------------------- #
-# Grounding (RAG) — compact, capped snapshot of all four stores
-# --------------------------------------------------------------------------- #
-def _cap(items, n=10):
-    return items[:n]
-
-
-def _grounding():
-    """Read-only summary of current suite state for the model's context."""
-    now = datetime.now()
-    lines = [f"Today is {now.strftime('%A %Y-%m-%d')}, current time "
-             f"{now.strftime('%H:%M')}.", ""]
-
-    b = MODULES["budget"]
-    summ = b.get_summary()
-    lines.append("BUDGET:")
-    if summ.get("ok"):
-        lines.append(f"  balance ${summ['balance']:.2f}; this month "
-                     f"(+${summ['month_earned']:.2f} / -${summ['month_spent']:.2f} "
-                     f"= net ${summ['month_net']:.2f})")
-    over = [l for l in b.limit_status().get("limits", []) if l.get("over")]
-    if over:
-        lines.append("  over limit: " + ", ".join(l["category"] for l in over))
-    due = [bl for bl in b.bill_status().get("bills", []) if bl.get("due_soon")]
-    if due:
-        lines.append("  bills due soon: "
-                     + ", ".join(f"{d['name']} ({d['next_due']})" for d in _cap(due)))
-
-    ev = _cap(MODULES["calendar"].list_events().get("events", []))
-    lines.append("CALENDAR (upcoming):")
-    lines += [f"  [{i}] {e.get('date','?')} {e.get('time','')} {e['title']} "
-              f"[{e.get('priority','')}]" for i, e in enumerate(ev)] or ["  (none)"]
-
-    items = _cap(MODULES["checklist"].list_items("open").get("items", []))
-    lines.append("CHECKLIST (open):")
-    lines += [f"  [{i}] {it['item']} [{it.get('priority','')}]"
-              for i, it in enumerate(items)] or ["  (none)"]
-
-    hb = _cap(MODULES["habits"].list_habits().get("habits", []))
-    lines.append("HABITS:")
-    lines += [f"  {h['name']} ({h['count']} done, last {h.get('last') or 'never'})"
-              for h in hb] or ["  (none)"]
-
-    return "\n".join(lines)
-
-
-_PERSONA = (
-    "You are a concise business assistant managing the user's budget, calendar, "
-    "checklist, and habits. Reply in one or two short, plain sentences suitable to "
-    "be read aloud. Give only the final answer — never show your reasoning. Never "
-    "invent data; rely on the summary and tool results."
-)
-
-
-# --------------------------------------------------------------------------- #
-# Two-stage routing
-# --------------------------------------------------------------------------- #
-_SELECT_MODULES_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "select_modules",
-        "description": (
-            "Route the user's request to the relevant suite modules. ALWAYS call this "
-            "exactly once. Include EVERY module the request touches — for a broad "
-            "question like 'what does my day look like' pick calendar, checklist, AND "
-            "habits. Pick a module for anything about money (budget), scheduling "
-            "(calendar), tasks/to-dos (checklist), or habits — especially any request "
-            "to add, change, complete, or delete something. Use an empty list ONLY for "
-            "pure small talk unrelated to those four areas."),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "modules": {
-                    "type": "array",
-                    "items": {"type": "string", "enum": list(MODULES)},
-                    "description": "All relevant modules, in the order to handle them.",
-                }
-            },
-            "required": ["modules"],
-        },
-    },
-}
-
-# Keyword safety-net: a small model sometimes free-texts a fake success instead of
-# calling select_module. If the message clearly targets a module, force the route so
-# the write actually runs. Order matters (habits before calendar so "did X today" wins).
-_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
-             "sunday", "today", "tomorrow", "tonight")
-_KEYWORDS = [
-    ("budget", ("balance", "spend", "spent", "budget", "bill", "income", "salary",
-                "expense", "transaction", "saving", "goal", "afford", "$", "dollar",
-                "paid", "pay ", "earn", "money", "limit", "cost")),
-    ("habits", ("habit", "streak", "workout", "every day", "everyday", "daily",
-                "did my", "track ", "meditat", "exercise")),
-    ("calendar", ("schedule", "appointment", "meeting", "event", "calendar",
-                  "remind me", "book ", "reschedule", "free on", "free this")),
-    ("checklist", ("checklist", "to-do", "todo", "to do", "task", " list", "mark ",
-                   "cross off", "need to", "get done", "done")),
-]
-
-
-def _keyword_route(text):
-    t = f" {text.lower()} "
-    for module, words in _KEYWORDS:
-        if any(w in t for w in words):
-            return module
-    if any(d in t for d in _WEEKDAYS):
-        return "calendar"
-    return None
-
-
-# Broad "how's my day" queries should always span calendar + checklist + habits — small
-# models tend to pick just one module, so force the set deterministically.
-_OVERVIEW = ("my day", "the day", "look like today", "today look", "my agenda",
-             "agenda", "overview", "rundown", "schedule today", "have today",
-             "on today", "brief me", "catch me up", "what do i have")
-_OVERVIEW_MODULES = ["calendar", "checklist", "habits"]
-
-
-def _is_overview(text):
-    t = text.lower()
-    return any(p in t for p in _OVERVIEW)
-
-
-def _stage1(user_message, grounding):
-    """Pick the relevant module(s), or answer directly from grounding. Returns
-    (modules: list, direct_reply | None). An empty list + None reply means the model
-    runtime was unreachable."""
-    messages = [
-        {"role": "system", "content": f"{_PERSONA}\n\nCurrent state:\n{grounding}"},
-        {"role": "user", "content": user_message},
-    ]
-    msg = _model_chat(messages, tools=[_SELECT_MODULES_TOOL])
-    if msg is None:
-        return [], None  # runtime down -> caller handles fallback
-    chosen = []
-    for call in (msg.tool_calls or []):
-        if call.function.name == "select_modules":
-            raw = dict(call.function.arguments).get("modules") or []
-            if isinstance(raw, str):
-                raw = [raw]
-            chosen = [m for m in raw if m in MODULES]
-            break
-    # Force the full set for broad day-overview questions (models under-select here).
-    overview = _OVERVIEW_MODULES if _is_overview(user_message) else []
-    if chosen or overview:
-        # De-dupe, preserve order.
-        return list(dict.fromkeys(chosen + overview)), None
-    # Model returned nothing / free-texted. Trust a keyword match over a possibly
-    # hallucinated answer so mutations aren't silently dropped.
-    net = _keyword_route(user_message)
-    if net:
-        return [net], None
-    return [], _clean(msg.content) or None
-
-
-# Read-only tool names across all modules; anything else that succeeds is a write
-# (drives the `changed` flag for auto-refreshing the affected tab).
-_READ_ACTIONS = {
-    "get_summary", "list_transactions", "list_categories", "limit_status",
-    "bill_status", "goal_status", "spending_breakdown",
-    "list_events", "list_items", "list_habits",
-}
-
-
-def _stage2_events(module_name, user_message, grounding, max_hops=4):
-    """Offer only the chosen module's tools; run a bounded tool-use loop.
-
-    A generator: yields ("stage", label) progress events as it works, then a single
-    terminal ("done", reply, action, results, pending, wrote) tuple, where `wrote` is
-    True if a successful mutating tool ran (so the caller can refresh that tab).
-    """
-    module = MODULES[module_name]
-    manifest = module.describe()
-    tools = [_as_function_tool(t) for t in manifest["tools"]]
-    messages = [
-        {"role": "system",
-         "content": (f"{_PERSONA}\n\nModule: {module_name}\n"
-                     f"{manifest['usage_rules']}\n\n"
-                     "To act, CALL the matching tool — including for delete/remove "
-                     "requests. Do NOT write your own confirmation question; the "
-                     "system adds confirmation automatically when a tool is "
-                     f"destructive.\n\nCurrent state:\n{grounding}")},
-        {"role": "user", "content": user_message},
-    ]
-    results = []
-    wrote = False
-    for _ in range(max_hops):
-        yield ("stage", "Deciding next step")
-        msg = _model_chat(messages, tools=tools)
-        if msg is None:
-            yield ("done", _HELP, "fallback", results, None, wrote)
-            return
-        calls = msg.tool_calls or []
-        if not calls:
-            yield ("stage", "Generating reply")
-            reply = _clean(msg.content) or "Done."
-            yield ("done", reply, ("tool_ok" if results else "answered"),
-                   results, None, wrote)
-            return
-        messages.append(msg)
-        for call in calls:
-            action = call.function.name
-            params = dict(call.function.arguments or {})
-            yield ("stage", f"Using {module_name}: {action.replace('_', ' ')}")
-            res = module.execute(action, params)
-            results.append(res)
-            if res.get("needs_confirmation"):
-                # Pause the whole turn: store the pending action, ask the user with a
-                # plain-language prompt (the module's raw message is dev-facing).
-                pending = {"module": module_name, "action": action,
-                           "params": params, "ts": datetime.now().isoformat()}
-                reply = (f"Please confirm: {action.replace('_', ' ')}. "
-                         "This can't be undone. Reply 'yes' to confirm or 'no' to "
-                         "cancel.")
-                yield ("done", reply, "needs_confirmation", results, pending, wrote)
-                return
-            if res.get("ok") and action not in _READ_ACTIONS:
-                wrote = True
-            messages.append({"role": "tool", "tool_name": action,
-                             "content": json.dumps(res)})
-    yield ("done", "Stopped after several steps — please rephrase.",
-           "tool_ok", results, None, wrote)
-
-
-# --------------------------------------------------------------------------- #
-# Confirmation resolution (deterministic, runs before routing)
+# Confirmation resolution (deterministic yes/no; runs before the model)
 # --------------------------------------------------------------------------- #
 def _norm(text):
     return re.sub(r"[.!?]+$", "", str(text).strip().lower())
@@ -434,77 +251,48 @@ def _pending_alive(pending):
 
 
 def _resolve_pending(session, text):
-    """If a live pending confirmation exists and the text is yes/no, resolve it.
-    Returns an envelope dict (with `modules`/`changed`), or None to let normal
-    routing proceed."""
+    """Resolve a live yes/no confirmation. Returns an envelope, or None to proceed."""
     pending = session.get("pending")
     if not _pending_alive(pending):
         session["pending"] = None
         return None
     word = _norm(text)
     if word in _AFFIRM:
-        module_name = pending["module"]
-        res = MODULES[module_name].execute(pending["action"], pending["params"],
-                                           confirm=True)
+        mod_name, action = pending["module"], pending["action"]
+        res = MODULES[mod_name].execute(action, pending["params"], confirm=True)
         session["pending"] = None
         reply = "Done." if res.get("ok") else f"Couldn't do that: {res.get('error')}"
         return {"reply": reply, "action": "confirmed", "results": [res],
-                "modules": [module_name], "changed": bool(res.get("ok"))}
+                "modules": [mod_name] if res.get("ok") else [],
+                "changed": bool(res.get("ok"))}
     if word in _DENY:
         session["pending"] = None
-        return {"reply": "Okay, cancelled — nothing changed.",
-                "action": "canceled", "results": [], "modules": [], "changed": False}
-    # Neither yes nor no: drop the stale prompt and treat as ordinary input.
-    session["pending"] = None
+        return {"reply": "Okay, cancelled — nothing changed.", "action": "canceled",
+                "results": [], "modules": [], "changed": False}
+    session["pending"] = None      # neither yes nor no -> drop stale prompt, proceed
     return None
 
 
 # --------------------------------------------------------------------------- #
-# Synthesis — combine several modules' tool results into one reply
-# --------------------------------------------------------------------------- #
-def _synthesize(user_message, grounding, collected):
-    """One model call that turns per-module tool results into a single short reply.
-    `collected` is a list of (module_name, results). Falls back to a plain join."""
-    blob = "\n".join(f"{m}: {json.dumps(r)}" for m, r in collected)
-    messages = [
-        {"role": "system",
-         "content": (f"{_PERSONA}\n\nCurrent state:\n{grounding}\n\n"
-                     "Combine the tool results below into ONE short, plain answer to "
-                     "the user. Mention each area briefly; skip empty ones.\n\n"
-                     f"Tool results:\n{blob}")},
-        {"role": "user", "content": user_message},
-    ]
-    msg = _model_chat(messages)
-    reply = _clean(msg.content) if msg else None
-    return reply or "Here's what I found across your tools."
-
-
-# --------------------------------------------------------------------------- #
-# Public API
+# Public API — the generic function-calling loop
 # --------------------------------------------------------------------------- #
 def chat_events(message, session_id=None):
-    """Process one user turn as a stream of events on a chat session.
-
-    Yields progress events `{"stage": "<label>"}` as the pipeline works, then exactly
-    one terminal event `{"final": {reply, action, results, modules, changed}}`. The
-    chat() wrapper drains this for non-streaming callers; the streaming HTTP route
-    relays every event so the UI can show a live timeline.
-    """
+    """Process one turn as a stream of events: zero or more {"stage": ...}, then one
+    {"final": {reply, action, results, modules, changed}}."""
     def final(reply, action, results, modules=None, changed=False):
         return {"final": {"reply": reply, "action": action, "results": results,
-                          "modules": modules or [], "changed": changed}}
+                          "modules": sorted(modules or []), "changed": changed}}
 
     text = str(message or "").strip()
     if not text:
-        yield final("What would you like to do? You can ask about your budget, "
-                    "calendar, checklist, or habits.", "empty", [])
+        yield final("What would you like to do?", "empty", [])
         return
 
     store = _load_store()
     session = _get_session(store, session_id)
     _record(session, "user", text)
 
-    # 1) Resolve an outstanding confirmation first.
+    # 1) Resolve an outstanding confirmation first (deterministic, no model call).
     resolved = _resolve_pending(session, text)
     if resolved is not None:
         yield {"stage": "Confirming action"}
@@ -514,68 +302,74 @@ def chat_events(message, session_id=None):
                     resolved["modules"], resolved["changed"])
         return
 
-    # 2) Route: stage 1 (which modules?) -> stage 2 per module -> synthesize.
-    yield {"stage": "Reading your data"}
-    grounding = _grounding()
+    # 2) Present all tools + context; let the model call whatever it needs.
+    yield {"stage": "Reading context"}
+    ctx = _context_block()
+    system = _PERSONA + (f"\n\nCurrent context (read-only):\n{ctx}" if ctx else "")
+    messages = [{"role": "system", "content": system}] + _recent_history(session)
 
-    yield {"stage": "Detecting tool usage"}
-    modules, direct = _stage1(text, grounding)
-
-    if not modules and direct is None:
-        # Model runtime unreachable.
-        _record(session, "assistant", _HELP)
-        _save_store(store)
-        yield final(_HELP, "fallback", [])
-        return
-
-    if not modules:
-        yield {"stage": "Generating reply"}
-        _record(session, "assistant", direct)
-        _save_store(store)
-        yield final(direct, "answered", [])
-        return
-
-    all_results = []
-    collected = []          # (module, results) for synthesis
-    per_module_reply = None
-    changed = False
-    acted = []
-    for module_name in modules:
-        yield {"stage": f"Checking {module_name}"}
-        m_reply = m_results = m_pending = None
-        m_wrote = False
-        for ev in _stage2_events(module_name, text, grounding):
-            if ev[0] == "stage":
-                yield {"stage": ev[1]}
-            else:
-                _, m_reply, m_action, m_results, m_pending, m_wrote = ev
-        acted.append(module_name)
-        all_results.extend(m_results or [])
-        collected.append((module_name, m_results or []))
-        per_module_reply = m_reply
-        changed = changed or m_wrote
-        # A destructive step pauses the whole turn immediately.
-        if m_pending is not None:
-            session["pending"] = m_pending
-            _record(session, "assistant", m_reply)
+    results, acted, changed = [], set(), False
+    for _ in range(_MAX_HOPS):
+        yield {"stage": "Thinking"}
+        msg = _model_chat(messages, tools=_TOOLSPECS)
+        if msg is None:
+            _record(session, "assistant", _HELP)
             _save_store(store)
-            yield final(m_reply, "needs_confirmation", all_results, acted, changed)
+            yield final(_HELP, "fallback", results, acted, changed)
             return
+        calls = msg.tool_calls or []
+        if not calls:
+            reply = _clean(msg.content) or "Done."
+            session["pending"] = None
+            _record(session, "assistant", reply)
+            _save_store(store)
+            yield final(reply, "tool_ok" if results else "answered",
+                        results, acted, changed)
+            return
+        messages.append(msg)
+        for call in calls:
+            full = call.function.name
+            params = dict(call.function.arguments or {})
+            if full not in _DISPATCH:
+                res = {"ok": False, "error": f"unknown tool '{full}'"}
+                results.append(res)
+                messages.append({"role": "tool", "tool_name": full,
+                                 "content": json.dumps(res)})
+                continue
+            mod_name, action = _DISPATCH[full]
+            yield {"stage": f"Calling {full}"}
+            res = MODULES[mod_name].execute(action, params)
+            results.append(res)
+            if res.get("needs_confirmation"):
+                session["pending"] = {"module": mod_name, "action": action,
+                                      "params": params, "ts": datetime.now().isoformat()}
+                reply = (res.get("message", "This action needs confirmation.")
+                         + " Reply 'yes' to confirm or 'no' to cancel.")
+                _record(session, "assistant", reply)
+                _save_store(store)
+                yield final(reply, "needs_confirmation", results, acted, changed)
+                return
+            if res.get("ok") and full in _MUTATING:
+                changed = True
+                acted.add(mod_name)
+            messages.append({"role": "tool", "tool_name": full,
+                             "content": json.dumps(res)})
 
+    # Hop limit hit — ask once more, no tools, for a final answer from the results.
+    yield {"stage": "Composing reply"}
+    messages.append({"role": "system",
+                     "content": "Answer the user now using the tool results above; "
+                                "do not call any more tools."})
+    msg = _model_chat(messages)
+    reply = (_clean(msg.content) if msg else "") or "Done."
     session["pending"] = None
-    if len(acted) > 1:
-        yield {"stage": "Composing summary"}
-        reply = _synthesize(text, grounding, collected)
-    else:
-        reply = per_module_reply or "Done."
     _record(session, "assistant", reply)
     _save_store(store)
-    yield final(reply, "tool_ok", all_results, acted, changed)
+    yield final(reply, "tool_ok", results, acted, changed)
 
 
 def chat(message, session_id=None):
-    """Process one user turn; returns the final envelope. Thin wrapper over
-    chat_events() for non-streaming callers (tests, the plain JSON route)."""
+    """Non-streaming wrapper — returns the final envelope."""
     result = {"reply": "", "action": "error", "results": [], "modules": [],
               "changed": False}
     for ev in chat_events(message, session_id):
@@ -585,7 +379,6 @@ def chat(message, session_id=None):
 
 
 def history(limit=30, session_id=None):
-    """Recent conversation for a session, oldest-first, capped to `limit`."""
     store = _load_store()
     session = _get_session(store, session_id)
     try:
@@ -596,7 +389,6 @@ def history(limit=30, session_id=None):
 
 
 def clear_history(session_id=None):
-    """Wipe a single session's history + pending (keeps the session itself)."""
     store = _load_store()
     session = _get_session(store, session_id)
     session["history"] = []
@@ -616,7 +408,6 @@ def _session_summary(sess):
 
 
 def list_sessions():
-    """All sessions (newest-updated first) + the active id."""
     store = _load_store()
     sessions = sorted(store["sessions"], key=lambda s: s.get("updated_at", ""),
                       reverse=True)
@@ -625,7 +416,6 @@ def list_sessions():
 
 
 def new_session():
-    """Create a fresh session and make it active."""
     store = _load_store()
     sess = _blank_session()
     store["sessions"].append(sess)
@@ -662,7 +452,7 @@ def delete_session(session_id):
     store["sessions"] = [s for s in store["sessions"] if s["id"] != session_id]
     if len(store["sessions"]) == before:
         return {"ok": False, "error": "no such session"}
-    if not store["sessions"]:                      # never leave zero sessions
+    if not store["sessions"]:
         store["sessions"] = [_blank_session()]
     if store["active_id"] == session_id:
         store["active_id"] = store["sessions"][0]["id"]

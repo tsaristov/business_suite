@@ -19,6 +19,7 @@ import importlib.util
 import json
 import os
 import sys
+from datetime import date as _date
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PRIORITIES = ("low", "med", "high")
@@ -40,10 +41,12 @@ _store = _sibling("calendar.py")  # reuse its load()/save() and data.json locati
 # Handlers — the actual read/use/write operations
 # --------------------------------------------------------------------------- #
 def list_events(date=None):
-    """Read: events sorted by date. Optional exact-date filter (YYYY-MM-DD)."""
-    events = sorted(_store.load(), key=lambda e: e.get("date", ""))
+    """Read: events with their stable `index` (raw store position, used by
+    update/delete), sorted by date. Optional exact-date filter (YYYY-MM-DD)."""
+    events = [{**e, "index": i} for i, e in enumerate(_store.load())]
     if date:
         events = [e for e in events if e.get("date") == date]
+    events.sort(key=lambda e: e.get("date", ""))
     return {"ok": True, "events": events}
 
 
@@ -93,6 +96,44 @@ def delete_event(index):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only context + destructive-action preview (the tool owns its own meaning)
+# --------------------------------------------------------------------------- #
+def context():
+    """Read-only summary for the assistant: current date + upcoming events with the
+    index to use for update/delete."""
+    today = _date.today().isoformat()
+    evs = [{**e, "index": i} for i, e in enumerate(_store.load())]
+    upcoming = sorted((e for e in evs if e.get("date", "") >= today),
+                      key=lambda e: (e.get("date", ""), e.get("time", "")))[:15]
+    lines = [f"Today is {today}."]
+    if upcoming:
+        lines.append("Upcoming events (index · date · time · title · priority):")
+        for e in upcoming:
+            lines.append(f"  [{e['index']}] {e.get('date', '?')} "
+                         f"{e.get('time', '') or 'all-day'} {e.get('title', '')} "
+                         f"[{e.get('priority', '')}]")
+    else:
+        lines.append("No upcoming events.")
+    return "\n".join(lines)
+
+
+def _preview(action, params):
+    """(exists, label) for a destructive action; label doubles as the not-found error."""
+    if action == "delete_event":
+        events = _store.load()
+        try:
+            i = int(params.get("index", -1))
+        except (TypeError, ValueError):
+            return False, "no event at that index"
+        if 0 <= i < len(events):
+            e = events[i]
+            return True, (f"'{e.get('title', '')}'"
+                          + (f" on {e['date']}" if e.get("date") else ""))
+        return False, "no event at that index"
+    return True, action.replace("_", " ")
+
+
+# --------------------------------------------------------------------------- #
 # Capability manifest
 # --------------------------------------------------------------------------- #
 USAGE_RULES = """\
@@ -130,6 +171,7 @@ TOOLS = [
     },
     {
         "name": "add_event",
+        "mutates": True,
         "description": "Create a calendar event.",
         "when_to_use": "User wants to schedule something.",
         "parameters": {
@@ -148,6 +190,7 @@ TOOLS = [
     },
     {
         "name": "update_event",
+        "mutates": True,
         "description": "Update fields of an existing event by index.",
         "when_to_use": "User reschedules or edits an event's details.",
         "parameters": {
@@ -167,6 +210,7 @@ TOOLS = [
     },
     {
         "name": "delete_event",
+        "mutates": True,
         "description": "Remove an event by index.",
         "when_to_use": "User cancels an event.",
         "parameters": {
@@ -205,8 +249,11 @@ def execute(action, params=None, confirm=False):
         return {"ok": False, "error": f"unknown action '{action}'",
                 "available": list(_HANDLERS)}
     if spec["requires_confirmation"] and not confirm:
+        exists, label = _preview(action, params)
+        if not exists:
+            return {"ok": False, "error": label}
         return {"ok": False, "needs_confirmation": True,
-                "message": f"'{action}' is destructive. Re-run with confirm=True.",
+                "message": f"Delete {label}? This can't be undone.",
                 "params": params}
     try:
         return _HANDLERS[action](**params)

@@ -19,7 +19,7 @@ import importlib.util
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import date as _date, datetime
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -95,6 +95,34 @@ def delete_habit(name):
 
 
 # --------------------------------------------------------------------------- #
+# Read-only context + destructive-action preview (the tool owns its own meaning)
+# --------------------------------------------------------------------------- #
+def context():
+    """Read-only summary for the assistant: each habit with total + today's status."""
+    today = _date.today().isoformat()
+    habits = _store.load()
+    if not habits:
+        return "No habits tracked."
+    lines = ["Habits (name · total · done today?):"]
+    for h in habits:
+        done_today = today in {str(c)[:10] for c in h.get("completions", [])}
+        lines.append(f"  {h['name']}: {len(h.get('completions', []))} done, "
+                     f"today {'yes' if done_today else 'no'}")
+    return "\n".join(lines)
+
+
+def _preview(action, params):
+    """(exists, label) for a destructive action; label doubles as the not-found error."""
+    if action == "delete_habit":
+        habits = _store.load()
+        n = str(params.get("name", "")).strip()
+        if _find(habits, n) != -1:
+            return True, f"habit '{n}' and its entire history"
+        return False, f"no habit named '{n}'"
+    return True, action.replace("_", " ")
+
+
+# --------------------------------------------------------------------------- #
 # Capability manifest
 # --------------------------------------------------------------------------- #
 USAGE_RULES = """\
@@ -124,6 +152,7 @@ TOOLS = [
     },
     {
         "name": "add_habit",
+        "mutates": True,
         "description": "Create a new habit to track.",
         "when_to_use": "User wants to start tracking a routine.",
         "parameters": {
@@ -135,6 +164,7 @@ TOOLS = [
     },
     {
         "name": "mark_complete",
+        "mutates": True,
         "description": "Log a completion for a habit (date+time).",
         "when_to_use": "User reports doing a tracked habit.",
         "parameters": {
@@ -150,6 +180,7 @@ TOOLS = [
     },
     {
         "name": "delete_habit",
+        "mutates": True,
         "description": "Remove a habit and its full completion history.",
         "when_to_use": "User wants to stop tracking a habit entirely.",
         "parameters": {
@@ -188,8 +219,11 @@ def execute(action, params=None, confirm=False):
         return {"ok": False, "error": f"unknown action '{action}'",
                 "available": list(_HANDLERS)}
     if spec["requires_confirmation"] and not confirm:
+        exists, label = _preview(action, params)
+        if not exists:
+            return {"ok": False, "error": label}
         return {"ok": False, "needs_confirmation": True,
-                "message": f"'{action}' is destructive. Re-run with confirm=True.",
+                "message": f"Delete {label}? This can't be undone.",
                 "params": params}
     try:
         return _HANDLERS[action](**params)

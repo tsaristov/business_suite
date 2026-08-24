@@ -48,8 +48,9 @@ def get_summary():
 
 
 def list_transactions(limit=None):
-    """Read: transaction history (optionally only the last N)."""
-    tx = _store.load()["transactions"]
+    """Read: transaction history with each row's stable `index` (raw store position,
+    used by delete_transaction), optionally only the last N."""
+    tx = [{**t, "index": i} for i, t in enumerate(_store.load()["transactions"])]
     if limit is not None:
         tx = tx[-int(limit):]
     return {"ok": True, "transactions": tx}
@@ -122,6 +123,53 @@ def remove_bill(index):
 
 def remove_goal(index):
     return _store.remove_goal(index)
+
+
+# --------------------------------------------------------------------------- #
+# Read-only context + destructive-action preview (the tool owns its own meaning)
+# --------------------------------------------------------------------------- #
+def context():
+    """Read-only summary for the assistant: balance, this month, over-limit, bills due."""
+    o = _store.overview()
+    lines = [f"Balance ${o['balance']:.2f}; this month +${o['month_earned']:.2f} / "
+             f"-${o['month_spent']:.2f} (net ${o['month_net']:.2f})."]
+    over = [l for l in _store.limit_status() if l.get("over")]
+    if over:
+        lines.append("Over limit: " + ", ".join(l["category"] for l in over) + ".")
+    due = [b for b in _store.bill_status() if b.get("due_soon")]
+    if due:
+        lines.append("Bills due soon: "
+                     + ", ".join(f"{b['name']} ({b['next_due']})" for b in due) + ".")
+    return "\n".join(lines)
+
+
+def _preview(action, params):
+    """(exists, label) for a destructive action; label doubles as the not-found error."""
+    data = _store.load()
+
+    def at(items, noun, fmt):
+        try:
+            i = int(params.get("index", -1))
+        except (TypeError, ValueError):
+            return False, f"no {noun} at that index"
+        if 0 <= i < len(items):
+            return True, fmt(items[i])
+        return False, f"no {noun} at that index"
+
+    if action == "delete_transaction":
+        return at(data["transactions"], "transaction",
+                  lambda t: f"a {t.get('category', '')} transaction of "
+                            f"${t.get('amount', 0)}")
+    if action == "remove_bill":
+        return at(data["bills"], "bill", lambda b: f"the bill '{b.get('name', '')}'")
+    if action == "remove_goal":
+        return at(data["goals"], "goal", lambda g: f"the goal '{g.get('name', '')}'")
+    if action == "remove_limit":
+        c = str(params.get("category", "")).strip()
+        if c.lower() in {l["category"].lower() for l in data["limits"]}:
+            return True, f"the {c} limit"
+        return False, f"no limit for '{c}'"
+    return True, action.replace("_", " ")
 
 
 # --------------------------------------------------------------------------- #
@@ -219,6 +267,7 @@ TOOLS = [
     },
     {
         "name": "add_transaction",
+        "mutates": True,
         "description": "Record income ('earned') or an expense ('spent'). Category required.",
         "when_to_use": "User reports money received or spent.",
         "parameters": {
@@ -236,6 +285,7 @@ TOOLS = [
     },
     {
         "name": "add_category",
+        "mutates": True,
         "description": "Register a new income source or expense category.",
         "when_to_use": "User introduces a category that doesn't exist yet.",
         "parameters": {
@@ -250,6 +300,7 @@ TOOLS = [
     },
     {
         "name": "set_limit",
+        "mutates": True,
         "description": "Create/update a monthly limit for a category (percent or fixed).",
         "when_to_use": "User sets a budget for a category.",
         "parameters": {
@@ -266,6 +317,7 @@ TOOLS = [
     },
     {
         "name": "add_bill",
+        "mutates": True,
         "description": "Add a recurring bill with a monthly due day (1-31).",
         "when_to_use": "User has a recurring bill to be reminded about.",
         "parameters": {
@@ -283,6 +335,7 @@ TOOLS = [
     },
     {
         "name": "add_goal",
+        "mutates": True,
         "description": "Create a savings goal with a target and optional target date.",
         "when_to_use": "User wants to save toward something.",
         "parameters": {
@@ -299,6 +352,7 @@ TOOLS = [
     },
     {
         "name": "contribute_goal",
+        "mutates": True,
         "description": "Add to a goal's saved amount; also logs a Savings expense.",
         "when_to_use": "User puts money toward a goal.",
         "parameters": {
@@ -313,6 +367,7 @@ TOOLS = [
     },
     {
         "name": "delete_transaction",
+        "mutates": True,
         "description": "Remove a transaction by index and recompute the balance.",
         "when_to_use": "User wants to undo a recorded transaction.",
         "parameters": {
@@ -324,6 +379,7 @@ TOOLS = [
     },
     {
         "name": "remove_limit",
+        "mutates": True,
         "description": "Delete a category's spending limit.",
         "when_to_use": "User no longer wants to budget a category.",
         "parameters": {
@@ -335,6 +391,7 @@ TOOLS = [
     },
     {
         "name": "remove_bill",
+        "mutates": True,
         "description": "Delete a bill by index.",
         "when_to_use": "A bill no longer applies.",
         "parameters": {
@@ -346,6 +403,7 @@ TOOLS = [
     },
     {
         "name": "remove_goal",
+        "mutates": True,
         "description": "Delete a savings goal by index.",
         "when_to_use": "User abandons or completes a goal.",
         "parameters": {
@@ -397,8 +455,11 @@ def execute(action, params=None, confirm=False):
         return {"ok": False, "error": f"unknown action '{action}'",
                 "available": list(_HANDLERS)}
     if spec["requires_confirmation"] and not confirm:
+        exists, label = _preview(action, params)
+        if not exists:
+            return {"ok": False, "error": label}
         return {"ok": False, "needs_confirmation": True,
-                "message": f"'{action}' is destructive. Re-run with confirm=True.",
+                "message": f"Delete {label}? This can't be undone.",
                 "params": params}
     try:
         return _HANDLERS[action](**params)
