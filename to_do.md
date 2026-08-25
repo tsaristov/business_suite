@@ -1,0 +1,4 @@
+- add rag/settings system: Should be able to upload RAG documents, system prompts, rules, and other information for the settings of the system. Take inspiration from the code in ../mk1/rag-template/rag-cli for the RAG system, and create a settings system for modifying the LLMs settings/tweaks.
+- image uploads: allow there to be file/image uploads to the text box in addition to the prompt.
+- add research tool: allow LLM to do basic research capablitiies, and outputting a downloadable PDF file containing research outcomes, as well as writing a short summary of the resarch outcome.
+- add email connectivity tool: be able to see and read your emails, and allow LLm to see and read emails. Allow for multiple email accounts to be logged into and accessed as well. 

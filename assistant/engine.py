@@ -37,7 +37,24 @@ _DATA = os.path.join(_HERE, "data.json")
 
 # A capable, non-reasoning tool-caller. All tools are shown in one call, so the model
 # must handle many functions + genuine intent understanding. Override with OLLAMA_MODEL.
+# This is only the fallback; the live model/temperature/prompt come from settings.py so
+# the user can tweak them from the Settings tab without a restart.
 MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:latest")
+
+
+def _load_sibling(filename, modname):
+    """Load a module living next to engine.py by path (engine runs outside a package)."""
+    path = os.path.join(_HERE, filename)
+    spec = importlib.util.spec_from_file_location(modname, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+settings = _load_sibling("settings.py", "assistant_settings")
+
+# Uploaded document text is truncated to keep prompts sane.
+_MAX_ATTACH_CHARS = 12000
 
 _MAX_HOPS = 6          # bound the tool-use loop per turn
 _PENDING_TTL_SECONDS = 5 * 60
@@ -211,20 +228,101 @@ def _recent_history(session, limit=10):
 # --------------------------------------------------------------------------- #
 # Ollama adapter (the only provider-specific code)
 # --------------------------------------------------------------------------- #
-def _model_chat(messages, tools=None):
-    """Call the local model. Returns the message object, or None if unreachable."""
+def _model_chat(messages, tools=None, cfg=None):
+    """Call the local model. Returns the message object, or None if unreachable.
+    Model tag and temperature come from settings (cfg), falling back to defaults."""
+    cfg = cfg or {}
     try:
         import ollama
         resp = ollama.chat(
-            model=MODEL,
+            model=cfg.get("model") or MODEL,
             messages=messages,
             tools=tools or None,
             think=False,
-            options={"temperature": 0.1},
+            options={"temperature": cfg.get("temperature", 0.1)},
         )
         return resp.message
     except Exception:
         return None
+
+
+def _vision_describe(image_b64, cfg):
+    """Describe an uploaded image with the vision model. Returns text or None.
+    Keeps vision separate from the tool-calling loop so the main model stays text-only."""
+    try:
+        import ollama
+        resp = ollama.chat(
+            model=cfg.get("vision_model") or settings.DEFAULTS["vision_model"],
+            messages=[{"role": "user",
+                       "content": "Describe this image in detail, including any visible "
+                                  "text, numbers, charts, or documents.",
+                       "images": [image_b64]}],
+            options={"temperature": 0.1},
+        )
+        return _clean(resp.message.content)
+    except Exception:
+        return None
+
+
+def _extract_file_text(name, mime, raw):
+    """Extract text from an uploaded document (pdf/docx/plain). Returns '' on failure.
+    Heavy parsers are imported lazily so a missing dep only disables that file type."""
+    lower = str(name or "").lower()
+    mime = (mime or "").lower()
+    text = ""
+    try:
+        if lower.endswith(".pdf") or mime == "application/pdf":
+            import io
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw))
+            text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        elif lower.endswith(".docx") or "word" in mime or "officedocument" in mime:
+            import tempfile
+            import docx2txt
+            with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tf:
+                tf.write(raw)
+                path = tf.name
+            try:
+                text = docx2txt.process(path) or ""
+            finally:
+                os.remove(path)
+        else:
+            text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+    text = text.strip()
+    if len(text) > _MAX_ATTACH_CHARS:
+        text = text[:_MAX_ATTACH_CHARS] + "…"
+    return text
+
+
+def _ingest_attachments(attachments, cfg):
+    """Turn uploaded files into text to append to the user's message. Images are
+    described by the vision model; documents are text-extracted. Returns '' if nothing
+    usable. `attachments` items: {name, mime, data_b64} (data_b64 may be a data URL)."""
+    if not attachments:
+        return ""
+    import base64
+    parts = []
+    for att in attachments:
+        name = att.get("name", "file")
+        mime = (att.get("mime") or "").lower()
+        b64 = att.get("data_b64") or ""
+        if b64.startswith("data:") and "," in b64:
+            b64 = b64.split(",", 1)[1]  # strip the data URL prefix
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            continue
+        if mime.startswith("image/"):
+            desc = _vision_describe(b64, cfg) or "(could not read this image)"
+            parts.append(f"[Image: {name}]\n{desc}")
+        else:
+            body = _extract_file_text(name, mime, raw)
+            parts.append(f"[File: {name}]\n{body or '(could not read this file)'}")
+    if not parts:
+        return ""
+    return "\n\nAttached files (provided by the user):\n" + "\n\n".join(parts)
 
 
 def _clean(content):
@@ -276,21 +374,23 @@ def _resolve_pending(session, text):
 # --------------------------------------------------------------------------- #
 # Public API — the generic function-calling loop
 # --------------------------------------------------------------------------- #
-def chat_events(message, session_id=None):
+def chat_events(message, session_id=None, attachments=None):
     """Process one turn as a stream of events: zero or more {"stage": ...}, then one
-    {"final": {reply, action, results, modules, changed}}."""
+    {"final": {reply, action, results, modules, changed}}. `attachments` is an optional
+    list of {name, mime, data_b64} uploaded alongside the text."""
     def final(reply, action, results, modules=None, changed=False):
         return {"final": {"reply": reply, "action": action, "results": results,
                           "modules": sorted(modules or []), "changed": changed}}
 
     text = str(message or "").strip()
-    if not text:
+    if not text and not attachments:
         yield final("What would you like to do?", "empty", [])
         return
 
     store = _load_store()
     session = _get_session(store, session_id)
-    _record(session, "user", text)
+    display = text or f"[sent {len(attachments)} attachment(s)]"
+    _record(session, "user", display)
 
     # 1) Resolve an outstanding confirmation first (deterministic, no model call).
     resolved = _resolve_pending(session, text)
@@ -302,16 +402,31 @@ def chat_events(message, session_id=None):
                     resolved["modules"], resolved["changed"])
         return
 
+    cfg = settings.get()
+
     # 2) Present all tools + context; let the model call whatever it needs.
     yield {"stage": "Reading context"}
     ctx = _context_block()
-    system = _PERSONA + (f"\n\nCurrent context (read-only):\n{ctx}" if ctx else "")
-    messages = [{"role": "system", "content": system}] + _recent_history(session)
+    system = cfg.get("system_prompt") or _PERSONA
+    rules = (cfg.get("rules") or "").strip()
+    if rules:
+        system += f"\n\nAdditional rules:\n{rules}"
+    if ctx:
+        system += f"\n\nCurrent context (read-only):\n{ctx}"
+    messages = ([{"role": "system", "content": system}]
+                + _recent_history(session, cfg.get("history_limit", 10)))
+
+    # 2b) Fold any uploaded files into the current user turn as text.
+    if attachments:
+        yield {"stage": "Reading attachments"}
+        attach_text = _ingest_attachments(attachments, cfg)
+        if attach_text and messages and messages[-1].get("role") == "user":
+            messages[-1]["content"] = (messages[-1].get("content") or "") + attach_text
 
     results, acted, changed = [], set(), False
     for _ in range(_MAX_HOPS):
         yield {"stage": "Thinking"}
-        msg = _model_chat(messages, tools=_TOOLSPECS)
+        msg = _model_chat(messages, tools=_TOOLSPECS, cfg=cfg)
         if msg is None:
             _record(session, "assistant", _HELP)
             _save_store(store)
@@ -360,7 +475,7 @@ def chat_events(message, session_id=None):
     messages.append({"role": "system",
                      "content": "Answer the user now using the tool results above; "
                                 "do not call any more tools."})
-    msg = _model_chat(messages)
+    msg = _model_chat(messages, cfg=cfg)
     reply = (_clean(msg.content) if msg else "") or "Done."
     session["pending"] = None
     _record(session, "assistant", reply)
@@ -368,11 +483,11 @@ def chat_events(message, session_id=None):
     yield final(reply, "tool_ok", results, acted, changed)
 
 
-def chat(message, session_id=None):
+def chat(message, session_id=None, attachments=None):
     """Non-streaming wrapper — returns the final envelope."""
     result = {"reply": "", "action": "error", "results": [], "modules": [],
               "changed": False}
-    for ev in chat_events(message, session_id):
+    for ev in chat_events(message, session_id, attachments):
         if "final" in ev:
             result = ev["final"]
     return result

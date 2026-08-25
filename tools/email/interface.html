@@ -1,0 +1,173 @@
+{# Email tool UI fragment. Rendered inside the Flask app's Email tab
+   (see templates/index.html). Add IMAP accounts (password -> OS keyring), browse an
+   inbox, and read messages. Read-only. Self-contained: Bootstrap 5.3 from index.html. #}
+
+<div class="row g-4">
+  <!-- Accounts -->
+  <div class="col-lg-4">
+    <div class="card mb-3">
+      <div class="card-header"><strong>Add account</strong></div>
+      <div class="card-body">
+        <div class="alert alert-warning py-2 small mb-3">
+          Use a provider <strong>app password</strong> (not your main password) and enable
+          IMAP. The password is stored in your OS keychain, never in the repo.
+        </div>
+        <form id="em-add" class="row g-2">
+          <div class="col-12"><input name="label" class="form-control form-control-sm"
+              placeholder="Label (e.g. Work Gmail)" required></div>
+          <div class="col-8"><input name="host" class="form-control form-control-sm"
+              placeholder="imap.gmail.com" required></div>
+          <div class="col-4"><input name="port" type="number" class="form-control form-control-sm"
+              value="993"></div>
+          <div class="col-12"><input name="username" class="form-control form-control-sm"
+              placeholder="you@example.com" required></div>
+          <div class="col-12"><input name="password" type="password"
+              class="form-control form-control-sm" placeholder="App password" required></div>
+          <div class="col-12 form-check ms-2">
+            <input class="form-check-input" type="checkbox" name="use_ssl" id="em-ssl" checked>
+            <label class="form-check-label small" for="em-ssl">Use SSL (port 993)</label>
+          </div>
+          <div class="col-12"><button class="btn btn-sm btn-primary w-100">Add account</button></div>
+        </form>
+        <div id="em-add-status" class="form-text"></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-header"><strong>Accounts</strong></div>
+      <ul id="em-accounts" class="list-group list-group-flush small"></ul>
+    </div>
+  </div>
+
+  <!-- Inbox + reader -->
+  <div class="col-lg-8">
+    <div class="d-flex justify-content-between align-items-center mb-2">
+      <div id="em-inbox-title" class="text-muted small">Select an account.</div>
+      <div class="form-check form-switch">
+        <input class="form-check-input" type="checkbox" id="em-unread">
+        <label class="form-check-label small" for="em-unread">Unread only</label>
+      </div>
+    </div>
+    <div class="row g-2">
+      <div class="col-md-6">
+        <ul id="em-list" class="list-group small" style="max-height: 460px; overflow-y:auto;"></ul>
+      </div>
+      <div class="col-md-6">
+        <div id="em-read" class="border rounded p-3 bg-light" style="max-height: 460px; overflow-y:auto;">
+          <span class="text-muted">Select a message to read.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const ACCOUNTS = "{{ url_for('email_accounts') }}";
+  const ADD = "{{ url_for('email_account_add') }}";
+  const REMOVE = "{{ url_for('email_account_remove') }}";
+  const LIST = "{{ url_for('email_list') }}";
+  const READ = "{{ url_for('email_read') }}";
+  const $ = (id) => document.getElementById(id);
+  let current = null;
+
+  function esc(s) { const d = document.createElement("div"); d.textContent = s || ""; return d.innerHTML; }
+
+  async function loadAccounts() {
+    let data;
+    try { data = await (await fetch(ACCOUNTS)).json(); } catch (e) { return; }
+    const box = $("em-accounts");
+    box.innerHTML = "";
+    const accts = (data && data.accounts) || [];
+    if (!accts.length) {
+      box.innerHTML = '<li class="list-group-item text-muted">No accounts yet.</li>';
+      return;
+    }
+    accts.forEach((a) => {
+      const li = document.createElement("li");
+      li.className = "list-group-item d-flex justify-content-between align-items-center";
+      const label = document.createElement("span");
+      label.className = "flex-grow-1 text-truncate"; label.style.cursor = "pointer";
+      label.innerHTML = "<strong>" + esc(a.label) + "</strong><br><span class='text-muted'>"
+        + esc(a.username) + "</span>";
+      label.addEventListener("click", () => openInbox(a.label));
+      const del = document.createElement("button");
+      del.className = "btn btn-sm btn-outline-danger"; del.textContent = "✕";
+      del.addEventListener("click", () => removeAccount(a.label));
+      li.append(label, del);
+      box.appendChild(li);
+    });
+  }
+
+  async function addAccount(e) {
+    e.preventDefault();
+    const fd = new FormData($("em-add"));
+    fd.set("use_ssl", $("em-ssl").checked ? "true" : "false");
+    $("em-add-status").textContent = "Adding…";
+    try {
+      const data = await (await fetch(ADD, { method: "POST", body: fd })).json();
+      if (data.ok) { $("em-add").reset(); $("em-ssl").checked = true;
+        $("em-add-status").className = "form-text text-success";
+        $("em-add-status").textContent = "Added."; await loadAccounts(); }
+      else { $("em-add-status").className = "form-text text-danger";
+        $("em-add-status").textContent = data.error || "Failed."; }
+    } catch (e2) { $("em-add-status").className = "form-text text-danger";
+      $("em-add-status").textContent = "Failed."; }
+  }
+
+  async function removeAccount(label) {
+    if (!window.confirm("Remove account '" + label + "'?")) return;
+    await fetch(REMOVE, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label }) });
+    if (current === label) { current = null; $("em-list").innerHTML = "";
+      $("em-inbox-title").textContent = "Select an account."; }
+    loadAccounts();
+  }
+
+  async function openInbox(label) {
+    current = label;
+    $("em-inbox-title").textContent = "Loading " + label + "…";
+    $("em-read").innerHTML = "<span class='text-muted'>Select a message to read.</span>";
+    const url = LIST + "?account=" + encodeURIComponent(label)
+      + "&unread_only=" + ($("em-unread").checked ? "true" : "false");
+    let data;
+    try { data = await (await fetch(url)).json(); } catch (e) { return; }
+    const box = $("em-list");
+    box.innerHTML = "";
+    if (!data.ok) {
+      $("em-inbox-title").textContent = label;
+      box.innerHTML = '<li class="list-group-item text-danger">' + esc(data.error) + "</li>";
+      return;
+    }
+    $("em-inbox-title").textContent = label + " — " + data.count + " message(s)";
+    if (!data.messages.length) {
+      box.innerHTML = '<li class="list-group-item text-muted">Nothing here.</li>'; return;
+    }
+    data.messages.forEach((m) => {
+      const li = document.createElement("li");
+      li.className = "list-group-item" + (m.unread ? " fw-bold" : "");
+      li.style.cursor = "pointer";
+      li.innerHTML = esc(m.subject) + "<br><span class='text-muted fw-normal'>"
+        + esc(m.from) + " · " + esc(m.date) + "</span>";
+      li.addEventListener("click", () => readMessage(label, m.uid));
+      box.appendChild(li);
+    });
+  }
+
+  async function readMessage(label, uid) {
+    $("em-read").innerHTML = "<span class='text-muted'>Loading…</span>";
+    const url = READ + "?account=" + encodeURIComponent(label) + "&uid=" + encodeURIComponent(uid);
+    let data;
+    try { data = await (await fetch(url)).json(); } catch (e) { return; }
+    if (!data.ok) { $("em-read").innerHTML = "<span class='text-danger'>" + esc(data.error) + "</span>"; return; }
+    $("em-read").innerHTML =
+      "<h6>" + esc(data.subject) + "</h6>"
+      + "<div class='small text-muted mb-2'><strong>From:</strong> " + esc(data.from)
+      + "<br><strong>Date:</strong> " + esc(data.date) + "</div><hr>"
+      + "<div style='white-space:pre-wrap;'>" + esc(data.body) + "</div>";
+  }
+
+  $("em-add").addEventListener("submit", addAccount);
+  $("em-unread").addEventListener("change", () => { if (current) openInbox(current); });
+  loadAccounts();
+})();
+</script>

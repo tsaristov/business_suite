@@ -1,0 +1,217 @@
+{# Settings tool UI fragment. Rendered inside the Flask app's Settings tab
+   (see templates/index.html). Two concerns:
+   1. Assistant LLM settings + system prompt / rules  (POST /api/settings)
+   2. Knowledge base (RAG) document management         (/knowledge/*)
+   Self-contained: Bootstrap 5.3 is loaded by index.html. #}
+
+<div class="row g-4">
+  <!-- LLM settings + steering text -->
+  <div class="col-lg-7">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <strong>Assistant settings</strong>
+        <button id="set-reset" class="btn btn-sm btn-outline-secondary" type="button">
+          Reset to defaults</button>
+      </div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label">Chat model</label>
+            <input id="set-model" class="form-control" placeholder="llama3.1:latest">
+            <div class="form-text">Ollama tag for the tool-calling loop.</div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Vision model</label>
+            <input id="set-vision_model" class="form-control" placeholder="llava:latest">
+            <div class="form-text">Used to describe uploaded images.</div>
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Embedding model</label>
+            <input id="set-embed_model" class="form-control" placeholder="nomic-embed-text">
+            <div class="form-text">Used by the knowledge base. Re-sync after changing.</div>
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Temperature</label>
+            <input id="set-temperature" type="number" step="0.1" min="0" max="1"
+                   class="form-control">
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Top-K</label>
+            <input id="set-top_k" type="number" min="1" max="10" class="form-control">
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">History</label>
+            <input id="set-history_limit" type="number" min="1" max="50" class="form-control">
+          </div>
+          <div class="col-12">
+            <label class="form-label">System prompt</label>
+            <textarea id="set-system_prompt" class="form-control" rows="6"></textarea>
+          </div>
+          <div class="col-12">
+            <label class="form-label">Extra rules</label>
+            <textarea id="set-rules" class="form-control" rows="4"
+                      placeholder="Additional instructions appended to the system prompt…"></textarea>
+          </div>
+        </div>
+        <div class="d-flex align-items-center gap-2 mt-3">
+          <button id="set-save" class="btn btn-primary" type="button">Save settings</button>
+          <span id="set-status" class="form-text m-0"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Knowledge base document manager -->
+  <div class="col-lg-5">
+    <div class="card">
+      <div class="card-header"><strong>Knowledge base (RAG)</strong></div>
+      <div class="card-body">
+        <p class="text-muted small mb-2">
+          Upload documents the assistant can search (PDF, DOCX, TXT, MD, and more).
+          It calls a <code>search_knowledge</code> tool when your question needs them.</p>
+        <div class="input-group mb-2">
+          <input id="kb-files" type="file" class="form-control" multiple>
+          <button id="kb-upload" class="btn btn-primary" type="button">Upload</button>
+        </div>
+        <div class="d-flex align-items-center gap-2 mb-3">
+          <button id="kb-sync" class="btn btn-sm btn-outline-secondary" type="button">
+            Re-sync index</button>
+          <span id="kb-status" class="form-text m-0"></span>
+        </div>
+        <ul id="kb-list" class="list-group small"></ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const GET = "{{ url_for('settings_get') }}";
+  const SAVE = "{{ url_for('settings_save') }}";
+  const RESET = "{{ url_for('settings_reset') }}";
+  const KB_LIST = "{{ url_for('knowledge_list') }}";
+  const KB_UPLOAD = "{{ url_for('knowledge_upload') }}";
+  const KB_REMOVE = "{{ url_for('knowledge_remove') }}";
+  const KB_SYNC = "{{ url_for('knowledge_sync') }}";
+  const $ = (id) => document.getElementById(id);
+  const FIELDS = ["model", "vision_model", "embed_model", "temperature", "top_k",
+                  "history_limit", "system_prompt", "rules"];
+
+  function fill(cfg) {
+    FIELDS.forEach((k) => { if ($("set-" + k)) $("set-" + k).value = cfg[k] ?? ""; });
+  }
+  function collect() {
+    const out = {};
+    FIELDS.forEach((k) => { out[k] = $("set-" + k).value; });
+    return out;
+  }
+  function flash(el, msg, ok) {
+    el.textContent = msg;
+    el.className = "form-text m-0 " + (ok ? "text-success" : "text-danger");
+    setTimeout(() => { el.textContent = ""; }, 4000);
+  }
+
+  async function load() {
+    try { fill(await (await fetch(GET)).json()); } catch (e) { /* ignore */ }
+  }
+
+  async function save() {
+    try {
+      const res = await fetch(SAVE, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(collect()),
+      });
+      fill(await res.json());
+      flash($("set-status"), "Saved.", true);
+    } catch (e) { flash($("set-status"), "Couldn't save.", false); }
+  }
+
+  async function reset() {
+    if (!window.confirm("Reset all assistant settings to defaults?")) return;
+    try { fill(await (await fetch(RESET, { method: "POST" })).json());
+          flash($("set-status"), "Reset to defaults.", true);
+    } catch (e) { flash($("set-status"), "Couldn't reset.", false); }
+  }
+
+  // --- knowledge base ------------------------------------------------------
+  function renderDocs(data) {
+    const box = $("kb-list");
+    box.innerHTML = "";
+    const docs = (data && data.documents) || [];
+    if (!docs.length) {
+      box.innerHTML = '<li class="list-group-item text-muted">No documents yet.</li>';
+    } else {
+      docs.forEach((d) => {
+        const li = document.createElement("li");
+        li.className = "list-group-item d-flex justify-content-between align-items-center";
+        const kb = (d.size / 1024).toFixed(1);
+        const label = document.createElement("span");
+        label.className = "text-truncate";
+        label.textContent = d.name + "  (" + kb + " KB)";
+        label.title = d.name;
+        const del = document.createElement("button");
+        del.className = "btn btn-sm btn-outline-danger"; del.textContent = "Delete";
+        del.addEventListener("click", () => removeDoc(d.name));
+        li.append(label, del);
+        box.appendChild(li);
+      });
+    }
+    const idx = (data && data.index) || {};
+    if (idx.last_sync) {
+      $("kb-status").textContent =
+        "Indexed " + (idx.chunks || 0) + " chunks · last sync " + idx.last_sync;
+      $("kb-status").className = "form-text m-0 text-muted";
+    }
+  }
+
+  async function loadDocs() {
+    try { renderDocs(await (await fetch(KB_LIST)).json()); } catch (e) { /* ignore */ }
+  }
+
+  async function upload() {
+    const input = $("kb-files");
+    if (!input.files.length) { flash($("kb-status"), "Choose files first.", false); return; }
+    const fd = new FormData();
+    Array.from(input.files).forEach((f) => fd.append("files", f));
+    flash($("kb-status"), "Uploading & indexing…", true);
+    try {
+      const res = await fetch(KB_UPLOAD, { method: "POST", body: fd });
+      const data = await res.json();
+      input.value = "";
+      await loadDocs();
+      flash($("kb-status"), data.ok ? "Indexed." : (data.error || "Upload failed."), !!data.ok);
+    } catch (e) { flash($("kb-status"), "Upload failed.", false); }
+  }
+
+  async function removeDoc(name) {
+    if (!window.confirm("Delete '" + name + "' from the knowledge base?")) return;
+    try {
+      const res = await fetch(KB_REMOVE, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json();
+      await loadDocs();
+      flash($("kb-status"), data.ok ? "Removed." : (data.error || "Failed."), !!data.ok);
+    } catch (e) { flash($("kb-status"), "Failed.", false); }
+  }
+
+  async function sync() {
+    flash($("kb-status"), "Re-indexing…", true);
+    try {
+      const data = await (await fetch(KB_SYNC, { method: "POST" })).json();
+      await loadDocs();
+      flash($("kb-status"), data.ok ? "Re-indexed." : (data.error || "Failed."), !!data.ok);
+    } catch (e) { flash($("kb-status"), "Failed.", false); }
+  }
+
+  $("set-save").addEventListener("click", save);
+  $("set-reset").addEventListener("click", reset);
+  $("kb-upload").addEventListener("click", upload);
+  $("kb-sync").addEventListener("click", sync);
+  load();
+  loadDocs();
+})();
+</script>

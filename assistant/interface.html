@@ -49,13 +49,18 @@
 
     <div id="asst-log" aria-live="polite"></div>
 
-    <div class="input-group mt-3">
+    <div id="asst-attachments" class="d-flex flex-wrap gap-2 mt-3"></div>
+    <div class="input-group mt-2">
       <button id="asst-mic" class="btn btn-outline-secondary" type="button"
               title="Speak">🎤</button>
+      <button id="asst-attach" class="btn btn-outline-secondary" type="button"
+              title="Attach image or file">📎</button>
       <input id="asst-input" class="form-control" placeholder="Ask or tell me something…"
              autocomplete="off">
       <button id="asst-send" class="btn btn-primary" type="button">Send</button>
     </div>
+    <input id="asst-file" type="file" multiple class="d-none"
+           accept="image/*,.pdf,.docx,.txt,.md,.csv,.json">
     <div id="asst-hint" class="form-text"></div>
   </div>
 </div>
@@ -72,6 +77,39 @@
   const input = $("asst-input");
   let muted = false;
   let activeId = null;
+  let attachments = [];                 // pending uploads: {name, mime, data_b64}
+  const MAX_BYTES = 8 * 1024 * 1024;    // 8 MB per file
+
+  // --- attachments ---------------------------------------------------------
+  function renderChips() {
+    const box = $("asst-attachments");
+    box.innerHTML = "";
+    attachments.forEach((a, i) => {
+      const chip = document.createElement("span");
+      chip.className = "badge bg-secondary d-inline-flex align-items-center gap-1";
+      chip.append(document.createTextNode(a.name));
+      const x = document.createElement("span");
+      x.textContent = "✕"; x.style.cursor = "pointer";
+      x.addEventListener("click", () => { attachments.splice(i, 1); renderChips(); });
+      chip.appendChild(x);
+      box.appendChild(chip);
+    });
+  }
+
+  function addFiles(files) {
+    Array.from(files).forEach((f) => {
+      if (f.size > MAX_BYTES) {
+        $("asst-hint").textContent = f.name + " is too large (max 8 MB).";
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        attachments.push({ name: f.name, mime: f.type || "", data_b64: reader.result });
+        renderChips();
+      };
+      reader.readAsDataURL(f);
+    });
+  }
 
   // --- rendering -----------------------------------------------------------
   function scroll() { log.scrollTop = log.scrollHeight; }
@@ -215,16 +253,20 @@
   // --- send a turn (streamed) ----------------------------------------------
   async function send(text) {
     text = (text != null ? text : input.value).trim();
-    if (!text) return;
+    if (!text && !attachments.length) return;
     input.value = "";
-    addBubble("user", text);
+    const atts = attachments.slice();
+    attachments = [];
+    renderChips();
+    const names = atts.map((a) => a.name).join(", ");
+    addBubble("user", (text ? text + "\n" : "") + (atts.length ? "📎 " + names : ""));
     const timeline = showTimeline();
     timeline.step("Sending…");
     try {
       const res = await fetch(STREAM, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text, session_id: activeId }),
+        body: JSON.stringify({ message: text, session_id: activeId, attachments: atts }),
       });
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
@@ -369,6 +411,8 @@
   // --- wire up -------------------------------------------------------------
   $("asst-send").addEventListener("click", () => send());
   input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
+  $("asst-attach").addEventListener("click", () => $("asst-file").click());
+  $("asst-file").addEventListener("change", (e) => { addFiles(e.target.files); e.target.value = ""; });
   $("asst-mute").addEventListener("click", () => {
     muted = !muted;
     $("asst-mute").textContent = muted ? "🔇" : "🔊";

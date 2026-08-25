@@ -3,3 +3,13 @@ __pycache__/
 *.pyc
 **/data.json
 seed.py
+
+# Assistant settings (user-specific LLM tweaks, prompt, rules)
+assistant/settings.json
+
+# Knowledge base: uploaded documents + vector store index
+tools/knowledge/data/
+tools/knowledge/.storage/
+
+# Generated research PDFs
+tools/research/reports/

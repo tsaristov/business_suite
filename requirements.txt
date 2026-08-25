@@ -1,3 +1,24 @@
 flask>=3.1
 jinja2>=3.1
 ollama>=0.4
+
+# RAG knowledge base (tools/knowledge) — adapted from mk1/rag-template/rag-cli
+llama-index-core
+llama-index-embeddings-ollama
+llama-index-llms-ollama
+llama-index-vector-stores-chroma
+llama-index-readers-file
+chromadb
+
+# Attachment + document text extraction (chat uploads, RAG ingest)
+pypdf
+docx2txt
+
+# Research tool (tools/research) — web search, page fetch, PDF report
+ddgs
+requests
+beautifulsoup4
+reportlab
+
+# Email tool (tools/email) — credentials stored in the OS keyring (imaplib/email are stdlib)
+keyring

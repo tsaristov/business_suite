@@ -1,0 +1,100 @@
+{# Research tool UI fragment. Rendered inside the Flask app's Research tab
+   (see templates/index.html). Kick off web research -> PDF report + summary, and list
+   past reports with download links. Self-contained: Bootstrap 5.3 from index.html. #}
+
+<div class="row g-2 align-items-end my-3">
+  <div class="col">
+    <label class="form-label">Research topic</label>
+    <input id="rs-topic" class="form-control"
+           placeholder="e.g. 2026 small-business tax deductions" autocomplete="off">
+  </div>
+  <div class="col-auto">
+    <label class="form-label">Sources</label>
+    <input id="rs-sources" type="number" min="1" max="10" value="5"
+           class="form-control" style="width: 6rem;">
+  </div>
+  <div class="col-auto">
+    <button id="rs-run" class="btn btn-primary">Research</button>
+  </div>
+</div>
+<div id="rs-status" class="form-text mb-2"></div>
+
+<ul id="rs-list" class="list-group"></ul>
+
+<script>
+(function () {
+  const RUN = "{{ url_for('research_run') }}";
+  const LIST = "{{ url_for('research_list') }}";
+  const DL = "{{ url_for('research_download', report_id='__ID__') }}";
+  const $ = (id) => document.getElementById(id);
+
+  function dlUrl(id) { return DL.replace("__ID__", encodeURIComponent(id)); }
+
+  function render(reports) {
+    const box = $("rs-list");
+    box.innerHTML = "";
+    if (!reports.length) {
+      box.innerHTML = '<li class="list-group-item text-muted">No reports yet.</li>';
+      return;
+    }
+    reports.forEach((r) => {
+      const li = document.createElement("li");
+      li.className = "list-group-item";
+      const head = document.createElement("div");
+      head.className = "d-flex justify-content-between align-items-start gap-2";
+      const title = document.createElement("div");
+      title.innerHTML = "<strong></strong><br><span class='text-muted small'></span>";
+      title.querySelector("strong").textContent = r.topic;
+      title.querySelector("span").textContent = r.created_at
+        + " · " + (r.sources ? r.sources.length : 0) + " sources";
+      const dl = document.createElement("a");
+      dl.className = "btn btn-sm btn-outline-primary"; dl.textContent = "Download PDF";
+      dl.href = dlUrl(r.id);
+      head.append(title, dl);
+      const summary = document.createElement("p");
+      summary.className = "mb-0 mt-2"; summary.textContent = r.summary || "";
+      li.append(head, summary);
+      box.appendChild(li);
+    });
+  }
+
+  async function load() {
+    try { render((await (await fetch(LIST)).json()).reports || []); }
+    catch (e) { /* ignore */ }
+  }
+
+  async function run() {
+    const topic = $("rs-topic").value.trim();
+    if (!topic) { $("rs-status").textContent = "Enter a topic first."; return; }
+    const sources = parseInt($("rs-sources").value, 10) || 5;
+    $("rs-run").disabled = true;
+    $("rs-status").className = "form-text mb-2 text-muted";
+    $("rs-status").textContent = "Researching… this can take a minute (search + read + write).";
+    try {
+      const res = await fetch(RUN, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ topic, max_sources: sources }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        $("rs-topic").value = "";
+        $("rs-status").className = "form-text mb-2 text-success";
+        $("rs-status").textContent = "Done: " + (data.summary || "report ready.");
+        await load();
+      } else {
+        $("rs-status").className = "form-text mb-2 text-danger";
+        $("rs-status").textContent = data.error || "Research failed.";
+      }
+    } catch (e) {
+      $("rs-status").className = "form-text mb-2 text-danger";
+      $("rs-status").textContent = "Research failed.";
+    } finally {
+      $("rs-run").disabled = false;
+    }
+  }
+
+  $("rs-run").addEventListener("click", run);
+  load();
+})();
+</script>

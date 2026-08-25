@@ -10,8 +10,10 @@ import os
 import re
 from datetime import date, datetime, timedelta
 
-from flask import Flask, Response, jsonify, redirect, render_template, request, url_for
+from flask import (Flask, Response, jsonify, redirect, render_template, request,
+                   send_file, url_for)
 from jinja2 import ChoiceLoader, FileSystemLoader
+from werkzeug.utils import secure_filename
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 TOOLS_DIR = os.path.join(BASE, "tools")
@@ -30,12 +32,22 @@ budget = _load_module("budget_mod", "budget", "budget.py")
 cal = _load_module("calendar_mod", "calendar", "calendar.py")
 checklist = _load_module("checklist_mod", "checklist", "checklist.py")
 habits = _load_module("habits_mod", "habits", "habits.py")
+knowledge = _load_module("knowledge_mod", "knowledge", "knowledge.py")
+research = _load_module("research_mod", "research", "research.py")
+mailbox = _load_module("email_mod", "email", "mailbox.py")
 
-# The assistant lives at assistant/engine.py (outside tools/); load it by full path.
-_asst_spec = importlib.util.spec_from_file_location(
-    "assistant_engine", os.path.join(BASE, "assistant", "engine.py"))
-assistant = importlib.util.module_from_spec(_asst_spec)
-_asst_spec.loader.exec_module(assistant)
+
+def _load_assistant_module(name, filename):
+    """Load a module living in assistant/ (outside tools/) by full path."""
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(BASE, "assistant", filename))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+assistant = _load_assistant_module("assistant_engine", "engine.py")
+settings = _load_assistant_module("assistant_settings_app", "settings.py")
 
 app = Flask(__name__)
 
@@ -391,7 +403,8 @@ def habits_complete(idx):
 def assistant_chat():
     payload = request.get_json(silent=True) or {}
     return jsonify(assistant.chat(payload.get("message", ""),
-                                  payload.get("session_id")))
+                                  payload.get("session_id"),
+                                  payload.get("attachments")))
 
 
 @app.route("/api/assistant/chat/stream", methods=["POST"])
@@ -401,9 +414,10 @@ def assistant_chat_stream():
     payload = request.get_json(silent=True) or {}
     message = payload.get("message", "")
     session_id = payload.get("session_id")
+    attachments = payload.get("attachments")
 
     def emit():
-        for event in assistant.chat_events(message, session_id):
+        for event in assistant.chat_events(message, session_id, attachments):
             yield json.dumps(event) + "\n"
 
     return Response(emit(), mimetype="application/x-ndjson")
@@ -446,6 +460,126 @@ def assistant_session_rename(sid):
 @app.route("/api/assistant/sessions/<sid>", methods=["DELETE"])
 def assistant_session_delete(sid):
     return jsonify(assistant.delete_session(sid))
+
+
+# --- Settings --- (LLM tweaks + system prompt/rules; consumed by assistant/engine.py)
+@app.route("/api/settings", methods=["GET"])
+def settings_get():
+    return jsonify(settings.get())
+
+
+@app.route("/api/settings", methods=["POST"])
+def settings_save():
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    return jsonify(settings.save(payload))
+
+
+@app.route("/api/settings/reset", methods=["POST"])
+def settings_reset():
+    return jsonify(settings.reset())
+
+
+# --- Knowledge (RAG) --- (document management; search is via the assistant's tool layer)
+@app.route("/knowledge/list", methods=["GET"])
+def knowledge_list():
+    return jsonify(knowledge.list_documents())
+
+
+@app.route("/knowledge/upload", methods=["POST"])
+def knowledge_upload():
+    files = request.files.getlist("files")
+    if not files and "file" in request.files:
+        files = [request.files["file"]]
+    dest = knowledge.data_dir()
+    saved = []
+    for f in files:
+        if not f or not f.filename:
+            continue
+        name = secure_filename(f.filename)
+        if not name:
+            continue
+        f.save(os.path.join(dest, name))
+        saved.append(name)
+    if not saved:
+        return jsonify({"ok": False, "error": "no files uploaded"}), 400
+    result = knowledge.sync()
+    return jsonify({"ok": result.get("ok", False), "saved": saved, **result})
+
+
+@app.route("/knowledge/remove", methods=["POST"])
+def knowledge_remove():
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    return jsonify(knowledge.remove_document(payload.get("name", "")))
+
+
+@app.route("/knowledge/sync", methods=["POST"])
+def knowledge_sync():
+    return jsonify(knowledge.sync())
+
+
+# --- Research --- (web research -> PDF report + summary; logic in tools/research)
+@app.route("/research/list", methods=["GET"])
+def research_list():
+    return jsonify(research.list_reports())
+
+
+@app.route("/research/run", methods=["POST"])
+def research_run():
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    topic = payload.get("topic", "")
+    return jsonify(research.run_research(topic))
+
+
+@app.route("/research/download/<report_id>", methods=["GET"])
+def research_download(report_id):
+    path = research.report_path(report_id)
+    if not path or not os.path.isfile(path):
+        return {"ok": False, "error": "no such report"}, 404
+    return send_file(path, as_attachment=True, download_name=os.path.basename(path))
+
+
+# --- Email --- (read-only IMAP; passwords live in the OS keyring, see tools/email)
+@app.route("/email/account/add", methods=["POST"])
+def email_account_add():
+    f = request.form
+    return jsonify(mailbox.add_account(
+        label=f.get("label", ""),
+        host=f.get("host", ""),
+        port=f.get("port", 993),
+        username=f.get("username", ""),
+        password=f.get("password", ""),
+        use_ssl=f.get("use_ssl", "true") not in ("false", "0", "", "off"),
+    ))
+
+
+@app.route("/email/account/remove", methods=["POST"])
+def email_account_remove():
+    payload = request.get_json(silent=True) or request.form.to_dict() or {}
+    return jsonify(mailbox.remove_account(payload.get("label", "")))
+
+
+@app.route("/email/list", methods=["GET"])
+def email_list():
+    return jsonify(mailbox.list_emails(
+        request.args.get("account", ""),
+        folder=request.args.get("folder", "INBOX"),
+        limit=int(request.args.get("limit", 20) or 20),
+        unread_only=request.args.get("unread_only", "false") in ("true", "1", "on"),
+    ))
+
+
+@app.route("/email/read", methods=["GET"])
+def email_read():
+    return jsonify(mailbox.read_email(
+        request.args.get("account", ""),
+        request.args.get("uid", ""),
+        folder=request.args.get("folder", "INBOX"),
+    ))
+
+
+@app.route("/email/accounts", methods=["GET"])
+def email_accounts():
+    return jsonify(mailbox.list_accounts())
 
 
 if __name__ == "__main__":
